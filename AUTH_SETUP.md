@@ -1,0 +1,116 @@
+# Auth Setup
+
+This backend now assumes:
+
+- Supabase Auth is the source of truth for email/password, Google, and Apple identities.
+- The browser client signs users in with Supabase and sends bearer tokens to this API.
+- This API verifies Supabase access tokens against the project's JWKS endpoint.
+
+## Environment variables
+
+Copy `.env.example` to `.env` and set:
+
+- `DATABASE_URL`: use the Supabase session pooler on port `5432`
+- `SUPABASE_URL`: your project URL, for example `https://<project-ref>.supabase.co`
+- `SUPABASE_PUBLISHABLE_KEY`: required for `POST /auth/signup` and `POST /auth/session`
+- `SUPABASE_JWT_AUDIENCE`: leave as `authenticated` unless you changed your JWT audience
+- `DB_MAX_CONNECTIONS`: defaults to `10`
+
+## Supabase dashboard steps
+
+1. Open your Supabase project.
+2. In `Authentication`, enable `Email` provider.
+3. Keep email confirmation enabled for production.
+4. Enable `Google` and `Apple` providers.
+5. Add your local and production callback URLs in the Auth redirect settings.
+6. Use the `Session pooler` connection string for `DATABASE_URL`.
+
+## Provider setup
+
+### Google
+
+1. Create a Web OAuth client in Google Cloud.
+2. Add your frontend origin to `Authorized JavaScript origins`.
+3. Add the callback URL shown in Supabase's Google provider form to `Authorized redirect URIs`.
+4. Paste the Google client ID and secret into Supabase.
+
+### Apple
+
+1. In Apple Developer, enable `Sign in with Apple` on your App ID.
+2. Create a `Services ID` for the website flow.
+3. Create a Sign in with Apple key.
+4. Paste the Services ID, Team ID, Key ID, and private key into Supabase's Apple provider form.
+
+## Backend routes
+
+- `GET /health`: liveness check
+- `POST /auth/signup`: create an email/password auth user and store `username` in Supabase user metadata
+- `POST /auth/session`: sign in with email/password and receive a Supabase session payload
+- `GET /me`: returns the verified Supabase user plus any claimed app profile
+- `PUT /me/profile`: create or update the authenticated user's app profile
+- `GET /profiles/:username`: fetch a public profile by username
+
+## Expected client flow
+
+1. Sign up with `email + password` in the browser with Supabase Auth.
+2. If you are testing from the backend first, call `POST /auth/signup`.
+3. Create a session with `POST /auth/session`.
+4. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
+5. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
+6. Send `Authorization: Bearer <access_token>` on protected API calls.
+
+## Content processing setup
+
+Saved content now queues background URL processing in Supabase instead of doing fetch/parse work inline in the Rust API.
+
+### Supabase extensions and migrations
+
+The database migrations now expect these managed extensions to be available:
+
+- `pgmq` for the durable queue
+- `pg_net` for the immediate post-commit function trigger
+- `pg_cron` for the once-per-minute recovery trigger
+
+### Edge Function
+
+Deploy the Supabase function at `supabase/functions/process-content-batch`.
+
+Set this Edge Function secret:
+
+- `CONTENT_PROCESSOR_SECRET`: shared secret required on the internal function request header
+
+Optional function tuning secrets:
+
+- `CONTENT_PROCESSING_BATCH_SIZE` defaults to `10`
+- `CONTENT_PROCESSING_VISIBILITY_TIMEOUT_SECONDS` defaults to `300`
+- `CONTENT_PROCESSING_STALE_AFTER_SECONDS` defaults to `900`
+- `CONTENT_PROCESSING_RETRY_LIMIT` defaults to `3`
+- `CONTENT_PROCESSING_HTTP_TIMEOUT_MS` defaults to `15000`
+- `CONTENT_PROCESSING_MAX_REDIRECTS` defaults to `5`
+- `CONTENT_PROCESSING_MAX_HTML_BYTES` defaults to `2097152`
+- `CONTENT_PROCESSING_MAX_OEMBED_BYTES` defaults to `131072`
+- `CONTENT_PROCESSING_FAVICON_MAX_BYTES` defaults to `262144`
+- `CONTENT_PROCESSING_MAX_PARSED_BLOCKS` defaults to `128`
+- `CONTENT_PROCESSING_MAX_TEXT_CHARS` defaults to `4000`
+- `CONTENT_PROCESSING_MAX_CODE_CHARS` defaults to `16000`
+- `CONTENT_PROCESSING_MAX_LIST_ITEMS` defaults to `50`
+- `CONTENT_PROCESSING_MAX_LIST_ITEM_CHARS` defaults to `500`
+- `CONTENT_PROCESSING_MAX_PARSED_DOCUMENT_BYTES` defaults to `262144`
+
+### Vault secrets for pg_net / cron
+
+The database helper `public.invoke_content_processor(...)` reads these secrets from Supabase Vault:
+
+- `project_url`
+- `publishable_key`
+- `content_processor_secret`
+
+Create them in SQL with values from your project:
+
+```sql
+select vault.create_secret('https://<project-ref>.supabase.co', 'project_url');
+select vault.create_secret('<your-publishable-key>', 'publishable_key');
+select vault.create_secret('<same-secret-as-edge-function>', 'content_processor_secret');
+```
+
+Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit. `pg_cron` also invokes the same function every minute as a recovery path.
