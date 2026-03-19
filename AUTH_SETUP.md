@@ -75,6 +75,8 @@ The database migrations now expect these managed extensions to be available:
 
 Deploy the Supabase function at `supabase/functions/process-content-batch`.
 
+Deploy the source refresh function at `supabase/functions/process-source-batch`.
+
 Set this Edge Function secret:
 
 - `CONTENT_PROCESSOR_SECRET`: shared secret required on the internal function request header
@@ -97,6 +99,20 @@ Optional function tuning secrets:
 - `CONTENT_PROCESSING_MAX_LIST_ITEM_CHARS` defaults to `500`
 - `CONTENT_PROCESSING_MAX_PARSED_DOCUMENT_BYTES` defaults to `262144`
 
+Optional source refresh tuning secrets:
+
+- `SOURCE_REFRESH_BATCH_SIZE` defaults to `10`
+- `SOURCE_REFRESH_VISIBILITY_TIMEOUT_SECONDS` defaults to `300`
+- `SOURCE_REFRESH_STALE_AFTER_SECONDS` defaults to `900`
+- `SOURCE_REFRESH_RETRY_LIMIT` defaults to `3`
+- `SOURCE_REFRESH_MAX_DISCOVERY_BYTES` defaults to `1048576`
+- `SOURCE_REFRESH_MAX_FEED_BYTES` defaults to `1048576`
+- `SOURCE_REFRESH_MAX_DISCOVERY_CANDIDATES` defaults to `8`
+- `SOURCE_REFRESH_BACKFILL_LIMIT` defaults to `30`
+- `SOURCE_REFRESH_MAX_FEED_ENTRIES` defaults to `100`
+- `SOURCE_REFRESH_INTERVAL_SECONDS` defaults to `3600`
+- `SOURCE_REFRESH_NO_FEED_RETRY_SECONDS` defaults to `21600`
+
 ### Vault secrets for pg_net / cron
 
 The database helper `public.invoke_content_processor(...)` reads these secrets from Supabase Vault:
@@ -114,3 +130,5 @@ select vault.create_secret('<same-secret-as-edge-function>', 'content_processor_
 ```
 
 Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit. `pg_cron` also invokes the same function every minute as a recovery path.
+
+Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, `publishable_key`, and `content_processor_secret` values.

@@ -127,10 +127,10 @@ fn normalize_optional_field(
 }
 
 fn map_profile_error(error: sqlx::Error) -> ApiError {
-    if let Some(database_error) = error.as_database_error() {
-        if database_error.code().as_deref() == Some("23505") {
-            return ApiError::conflict("Username is already taken");
-        }
+    if let Some(database_error) = error.as_database_error()
+        && database_error.code().as_deref() == Some("23505")
+    {
+        return ApiError::conflict("Username is already taken");
     }
 
     tracing::error!(error = %error, "profile query failed");

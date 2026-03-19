@@ -59,6 +59,7 @@ interface QueuePayload {
   content_id: string;
   trigger?: string;
   requested_at?: string;
+  retry_count?: number;
 }
 
 interface QueueMessageRow {
@@ -372,6 +373,8 @@ async function processQueueMessage(
     return;
   }
 
+  const retryCount = normalizeRetryCount(queueMessage.message?.retry_count);
+
   try {
     const processed = await processClaimedContent(claimed);
     await persistSuccess(claimed.id, processed);
@@ -380,15 +383,11 @@ async function processQueueMessage(
     const failure = ProcessingFailure.fromUnknown(error);
     await persistFailure(claimed.id, failure);
 
-    const attemptCount = Math.max(
-      claimed.fetch_attempt_count,
-      claimed.parse_attempt_count,
-    );
-    if (failure.retryable && attemptCount < maxRetries) {
+    if (failure.retryable && retryCount < maxRetries) {
       const retryDelaySeconds = RETRY_DELAYS_SECONDS[
-        Math.min(attemptCount - 1, RETRY_DELAYS_SECONDS.length - 1)
+        Math.min(retryCount, RETRY_DELAYS_SECONDS.length - 1)
       ];
-      await enqueueRetry(claimed.id, retryDelaySeconds);
+      await enqueueRetry(claimed.id, retryDelaySeconds, retryCount + 1);
       result.retried += 1;
     } else {
       result.failed += 1;
@@ -461,11 +460,12 @@ export async function fetchDocument(
   };
 }
 
-async function performValidatedFetch(
+export async function performValidatedFetch(
   initialUrl: string,
   input: {
     policy?: NetworkPolicy;
     accept?: string;
+    headers?: Record<string, string>;
     maxRedirects: number;
     trustedHosts?: Set<string>;
   },
@@ -486,12 +486,16 @@ async function performValidatedFetch(
 
     let response: Response;
     try {
+      const headers = new Headers(input.headers ?? {});
+      if (input.accept && !headers.has("accept")) {
+        headers.set("accept", input.accept);
+      }
+      if (!headers.has("user-agent")) {
+        headers.set("user-agent", USER_AGENT);
+      }
       response = await fetchImpl(validated.url, {
         redirect: "manual",
-        headers: {
-          "accept": input.accept ?? "*/*",
-          "user-agent": USER_AGENT,
-        },
+        headers,
         signal: AbortSignal.timeout(httpTimeoutMs),
       });
     } catch (error) {
@@ -610,7 +614,11 @@ function parseContentLength(value: string | null): number | null {
 }
 
 function isRedirectStatus(status: number): boolean {
-  return status >= 300 && status < 400;
+  return status === 301 ||
+    status === 302 ||
+    status === 303 ||
+    status === 307 ||
+    status === 308;
 }
 
 async function processArticleDocument(
@@ -889,12 +897,14 @@ async function persistFailure(
 async function enqueueRetry(
   contentId: string,
   delaySeconds: number,
+  retryCount: number,
 ): Promise<void> {
   const supabase = getSupabase();
   const { error } = await supabase.rpc("enqueue_content_processing", {
     p_content_id: contentId,
     p_trigger: "retry",
     p_delay_seconds: delaySeconds,
+    p_retry_count: retryCount,
   });
 
   if (error) {
@@ -902,6 +912,12 @@ async function enqueueRetry(
       `Failed to enqueue retry for ${contentId}: ${error.message}`,
     );
   }
+}
+
+function normalizeRetryCount(value: number | undefined): number {
+  return Number.isFinite(value) && value !== undefined && value > 0
+    ? Math.trunc(value)
+    : 0;
 }
 
 async function archiveQueueMessage(msgId: number): Promise<void> {

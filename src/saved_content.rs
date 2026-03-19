@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 
 use axum::{
     Json,
@@ -18,6 +18,11 @@ use crate::{
     auth::AuthenticatedUser,
     content::{
         NormalizedUrl, ProcessingStatus, ReadState, SourceKind, TagScope, normalize_tag_slug,
+    },
+    embedded_content::{
+        CompactContentBody, build_compact_content_body, maybe_timestamp_seconds,
+        parse_db_processing_status, parse_db_read_state, parse_db_tag_scope,
+        parse_optional_source_kind, timestamp_seconds,
     },
     error::{ApiError, ApiResult},
 };
@@ -403,12 +408,13 @@ async fn enqueue_content_processing(
 ) -> ApiResult<()> {
     sqlx::query_scalar::<_, i64>(
         r#"
-        select public.enqueue_content_processing($1, $2, $3)
+        select public.enqueue_content_processing($1, $2, $3, $4)
         "#,
     )
     .bind(content_id)
     .bind(trigger)
     .bind(delay_seconds)
+    .bind(0_i32)
     .fetch_one(&mut **transaction)
     .await
     .map_err(map_saved_content_error)?;
@@ -421,7 +427,7 @@ async fn invoke_content_processor(
     content_id: Uuid,
     trigger: &str,
 ) -> ApiResult<()> {
-    sqlx::query_scalar::<_, Option<i64>>(
+    let job_id = sqlx::query_scalar::<_, Option<i64>>(
         r#"
         select public.invoke_content_processor(
             jsonb_build_object(
@@ -436,6 +442,14 @@ async fn invoke_content_processor(
     .fetch_one(&mut **transaction)
     .await
     .map_err(map_saved_content_error)?;
+
+    if job_id.is_none() {
+        tracing::warn!(
+            %content_id,
+            trigger,
+            "content processor invoke skipped because required Vault secrets are missing",
+        );
+    }
 
     Ok(())
 }
@@ -868,6 +882,8 @@ fn build_saved_content_summary(
     row: SavedContentSummaryRow,
     tags: Vec<TagSummary>,
 ) -> ApiResult<SavedContentSummary> {
+    let source_kind = parse_optional_source_kind(row.source_kind.as_deref())?;
+
     Ok(SavedContentSummary {
         id: row.saved_content_id,
         submitted_url: row.submitted_url,
@@ -883,7 +899,7 @@ fn build_saved_content_summary(
             resolved_url: row.resolved_url,
             host: row.host,
             site_name: row.site_name,
-            source_kind: parse_optional_source_kind(row.source_kind)?,
+            source_kind,
             title: row.title,
             excerpt: row.excerpt,
             author: row.author,
@@ -904,7 +920,7 @@ fn build_saved_content_detail(
     row: SavedContentDetailRow,
     tags: Vec<TagSummary>,
 ) -> ApiResult<SavedContentDetail> {
-    let source_kind = parse_optional_source_kind(row.source_kind.clone())?;
+    let source_kind = parse_optional_source_kind(row.source_kind.as_deref())?;
     let body = row
         .parsed_document
         .as_ref()
@@ -962,220 +978,6 @@ fn build_saved_content_update_row(
         archived_at: row.archived_at,
         read_completed_at: row.read_completed_at,
     })
-}
-
-fn parse_db_read_state(value: &str) -> ApiResult<ReadState> {
-    ReadState::from_str(value).map_err(|_| ApiError::internal("Stored read state was invalid"))
-}
-
-fn parse_db_processing_status(value: &str) -> ApiResult<ProcessingStatus> {
-    ProcessingStatus::from_str(value)
-        .map_err(|_| ApiError::internal("Stored processing status was invalid"))
-}
-
-fn parse_db_tag_scope(value: &str) -> ApiResult<TagScope> {
-    TagScope::from_str(value).map_err(|_| ApiError::internal("Stored tag scope was invalid"))
-}
-
-fn parse_optional_source_kind(value: Option<String>) -> ApiResult<Option<SourceKind>> {
-    value
-        .as_deref()
-        .map(SourceKind::from_str)
-        .transpose()
-        .map_err(|_| ApiError::internal("Stored source kind was invalid"))
-}
-
-fn timestamp_seconds(value: OffsetDateTime) -> i64 {
-    value.unix_timestamp()
-}
-
-fn maybe_timestamp_seconds(value: Option<OffsetDateTime>) -> Option<i64> {
-    value.map(timestamp_seconds)
-}
-
-fn build_compact_content_body(
-    parsed_document: &Value,
-    fallback_source_kind: Option<SourceKind>,
-) -> Option<CompactContentBody> {
-    let blocks = parsed_document.get("blocks")?.as_array()?;
-    let mut compact_blocks = Vec::new();
-    for block in blocks {
-        append_compact_content_blocks(block, &mut compact_blocks);
-    }
-
-    if compact_blocks.is_empty() {
-        return None;
-    }
-
-    let kind = parsed_document
-        .get("kind")
-        .and_then(Value::as_str)
-        .and_then(parse_compact_body_kind)
-        .or_else(|| fallback_source_kind.filter(|kind| is_compact_body_kind(*kind)))
-        .unwrap_or(SourceKind::Article);
-
-    Some(CompactContentBody {
-        kind,
-        blocks: compact_blocks,
-    })
-}
-
-fn append_compact_content_blocks(value: &Value, out: &mut Vec<CompactContentBlock>) {
-    let Some(block) = value.as_object() else {
-        return;
-    };
-
-    let Some(block_type) = json_string(block, "type") else {
-        return;
-    };
-
-    match block_type {
-        "heading" => {
-            let Some(text) = json_string(block, "text")
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            else {
-                return;
-            };
-            let level = block
-                .get("level")
-                .and_then(Value::as_u64)
-                .map(|value| value.clamp(1, 6) as u8)
-                .unwrap_or(2);
-
-            out.push(CompactContentBlock::Heading {
-                level,
-                text: text.to_string(),
-            });
-        }
-        "paragraph" => {
-            let Some(text) = json_string(block, "text")
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            else {
-                return;
-            };
-            out.push(CompactContentBlock::Paragraph {
-                text: text.to_string(),
-            });
-        }
-        "quote" => {
-            let Some(text) = json_string(block, "text")
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            else {
-                return;
-            };
-            out.push(CompactContentBlock::Quote {
-                text: text.to_string(),
-            });
-        }
-        "list" => {
-            let items = block
-                .get("items")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if items.is_empty() {
-                return;
-            }
-
-            out.push(CompactContentBlock::List {
-                ordered: json_string(block, "style") == Some("numbered"),
-                items,
-            });
-        }
-        "code" => {
-            let Some(text) = json_string(block, "text")
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            else {
-                return;
-            };
-            out.push(CompactContentBlock::Code {
-                language: json_string(block, "language")
-                    .map(str::trim)
-                    .filter(|language| !language.is_empty())
-                    .map(str::to_string),
-                text: text.to_string(),
-            });
-        }
-        "thread_post" => append_thread_post_blocks(block, out),
-        _ => {}
-    }
-}
-
-fn append_thread_post_blocks(
-    block: &serde_json::Map<String, Value>,
-    out: &mut Vec<CompactContentBlock>,
-) {
-    if let Some(heading) = build_thread_post_heading(block) {
-        out.push(CompactContentBlock::Heading {
-            level: 3,
-            text: heading,
-        });
-    }
-
-    let Some(text) = json_string(block, "text")
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    else {
-        return;
-    };
-    out.push(CompactContentBlock::Paragraph {
-        text: text.to_string(),
-    });
-}
-
-fn build_thread_post_heading(block: &serde_json::Map<String, Value>) -> Option<String> {
-    let display_name = json_string(block, "display_name")
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let author_handle = json_string(block, "author_handle")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_start_matches('@'));
-
-    match (display_name, author_handle) {
-        (Some(display_name), Some(author_handle))
-            if display_name
-                .trim_start_matches('@')
-                .eq_ignore_ascii_case(author_handle) =>
-        {
-            Some(display_name.to_string())
-        }
-        (Some(display_name), Some(author_handle)) => {
-            Some(format!("{display_name} (@{author_handle})"))
-        }
-        (Some(display_name), None) => Some(display_name.to_string()),
-        (None, Some(author_handle)) => Some(format!("@{author_handle}")),
-        (None, None) => None,
-    }
-}
-
-fn parse_compact_body_kind(value: &str) -> Option<SourceKind> {
-    match value {
-        "article" => Some(SourceKind::Article),
-        "thread" => Some(SourceKind::Thread),
-        "post" => Some(SourceKind::Post),
-        _ => None,
-    }
-}
-
-fn is_compact_body_kind(kind: SourceKind) -> bool {
-    matches!(
-        kind,
-        SourceKind::Article | SourceKind::Thread | SourceKind::Post
-    )
-}
-
-fn json_string<'a>(value: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
-    value.get(key)?.as_str()
 }
 
 fn should_enqueue_content_processing(content: &ContentProcessingStateRow) -> bool {
@@ -1395,48 +1197,6 @@ pub struct SavedContentDetail {
     content: ContentDetail,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-pub struct CompactContentBody {
-    kind: SourceKind,
-    blocks: Vec<CompactContentBlock>,
-}
-
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-#[serde(tag = "t")]
-pub enum CompactContentBlock {
-    #[serde(rename = "h")]
-    Heading {
-        #[serde(rename = "l")]
-        level: u8,
-        #[serde(rename = "x")]
-        text: String,
-    },
-    #[serde(rename = "p")]
-    Paragraph {
-        #[serde(rename = "x")]
-        text: String,
-    },
-    #[serde(rename = "q")]
-    Quote {
-        #[serde(rename = "x")]
-        text: String,
-    },
-    #[serde(rename = "l")]
-    List {
-        #[serde(rename = "o")]
-        ordered: bool,
-        #[serde(rename = "i")]
-        items: Vec<String>,
-    },
-    #[serde(rename = "c")]
-    Code {
-        #[serde(rename = "lang", skip_serializing_if = "Option::is_none")]
-        language: Option<String>,
-        #[serde(rename = "x")]
-        text: String,
-    },
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 struct SavedContentCursor {
     updated_at_unix_nanos: i128,
@@ -1560,12 +1320,15 @@ struct FaviconRow {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactContentBlock, CompactContentBody, ContentDetail, ContentProcessingStateRow,
-        ContentSummary, SavedContentDetail, SavedContentSummary, SavedContentSummaryRow,
-        TagSummary, build_compact_content_body, decode_cursor, encode_cursor, humanize_tag_slug,
-        normalize_page_size, normalize_requested_tag_slugs, should_enqueue_content_processing,
+        ContentDetail, ContentProcessingStateRow, ContentSummary, SavedContentDetail,
+        SavedContentSummary, SavedContentSummaryRow, TagSummary, decode_cursor, encode_cursor,
+        humanize_tag_slug, normalize_page_size, normalize_requested_tag_slugs,
+        should_enqueue_content_processing,
     };
     use crate::content::{ProcessingStatus, ReadState, SourceKind, TagScope};
+    use crate::embedded_content::{
+        CompactContentBlock, CompactContentBody, build_compact_content_body,
+    };
     use serde_json::json;
     use time::OffsetDateTime;
     use uuid::Uuid;

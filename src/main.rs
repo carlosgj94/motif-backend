@@ -2,10 +2,12 @@ mod auth;
 mod auth_api;
 mod config;
 mod content;
+mod embedded_content;
 mod error;
 mod profile;
 mod rate_limit;
 mod saved_content;
+mod source_subscriptions;
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -73,6 +75,21 @@ async fn main() {
         .route(
             "/me/content/{content_id}/favicon",
             get(saved_content::get_content_favicon),
+        )
+        .route(
+            "/me/source-subscriptions",
+            post(source_subscriptions::create_source_subscription)
+                .get(source_subscriptions::list_source_subscriptions),
+        )
+        .route(
+            "/me/source-subscriptions/{subscription_id}",
+            axum::routing::delete(source_subscriptions::delete_source_subscription),
+        )
+        .route("/me/inbox", get(source_subscriptions::list_inbox))
+        .route(
+            "/me/inbox/{inbox_item_id}",
+            get(source_subscriptions::get_inbox_item)
+                .patch(source_subscriptions::update_inbox_item),
         )
         .route("/profiles/{username}", get(profile::public_profile))
         .with_state(AppState {

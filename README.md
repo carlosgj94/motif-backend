@@ -13,6 +13,8 @@ This API is designed around bearer-token authenticated requests.
 - `GET /me/saved-content` returns summary rows for the user library.
 - `GET /me/saved-content/{saved_content_id}` returns one saved record with the compact text body the device can render.
 - `POST /me/saved-content` saves a new URL and kicks background processing.
+- `POST /me/source-subscriptions` subscribes to a blog or source homepage.
+- `GET /me/inbox` returns subscription-delivered posts without auto-saving them.
 
 Use these examples with your own base URL:
 
@@ -218,4 +220,127 @@ For a low-resource device, the normal flow is:
 3. Call `GET /me/saved-content/{saved_content_id}` only when the user opens one item.
 4. Read `content.body.blocks` and render that compact text representation.
 5. Use `POST /me/saved-content` when the user saves a new URL.
+
+## Source Subscription Flow
+
+Subscriptions are source-level, not article-level. A subscription discovers a feed, refreshes it in the background, and delivers matching posts to the user inbox.
+
+### 1. Subscribe to a source
+
+Submit a source homepage URL. `feed_url` is optional and only needed when discovery should skip homepage parsing.
+
+```bash
+curl -sS -X POST "$API/me/source-subscriptions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_url": "https://cra.mr/"
+  }' \
+  | jq
+```
+
+Example shape:
+
+```json
+{
+  "id": "source-subscription-id",
+  "created_at": 1773771700,
+  "updated_at": 1773771700,
+  "source": {
+    "id": "source-id",
+    "source_url": "https://cra.mr/",
+    "host": "cra.mr",
+    "source_kind": "website",
+    "refresh_status": "pending"
+  }
+}
+```
+
+### 2. List subscriptions
+
+```bash
+curl -sS "$API/me/source-subscriptions" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+### 3. Read the inbox
+
+The inbox is summary-only and separate from `saved-content`.
+
+```bash
+curl -sS "$API/me/inbox?limit=20" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+Example shape:
+
+```json
+{
+  "inbox": [
+    {
+      "id": "inbox-item-id",
+      "subscription_id": "source-subscription-id",
+      "delivered_at": 1773771800,
+      "read_state": "unread",
+      "is_saved": false,
+      "source": {
+        "id": "source-id",
+        "source_url": "https://cra.mr/",
+        "host": "cra.mr",
+        "title": "CRA",
+        "primary_feed_url": "https://cra.mr/feed.xml",
+        "refresh_status": "succeeded"
+      },
+      "content": {
+        "id": "content-id",
+        "canonical_url": "https://cra.mr/optimizing-content-for-agents/",
+        "host": "cra.mr",
+        "title": "Optimizing Content for Agents",
+        "fetch_status": "succeeded",
+        "parse_status": "succeeded"
+      }
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+### 4. Read one inbox item
+
+The detail response uses the same compact text contract as saved content.
+
+```bash
+INBOX_ITEM_ID='inbox-item-id'
+
+curl -sS "$API/me/inbox/$INBOX_ITEM_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+### 5. Update inbox state
+
+```bash
+curl -sS -X PATCH "$API/me/inbox/$INBOX_ITEM_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "read_state": "read",
+    "is_dismissed": false
+  }' \
+  | jq
+```
+
+### 6. Unsubscribe
+
+This stops future deliveries but keeps already delivered inbox rows.
+
+```bash
+SUBSCRIPTION_ID='source-subscription-id'
+
+curl -sS -X DELETE "$API/me/source-subscriptions/$SUBSCRIPTION_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -i
+```
 6. Poll the detail endpoint until processing completes.

@@ -72,12 +72,12 @@ impl NormalizedUrl {
             "https" => Some(443),
             _ => None,
         };
-        if let Some(explicit_port) = url.port() {
-            if Some(explicit_port) != default_port {
-                return Err(ApiError::bad_request(
-                    "url must use the default port for its scheme",
-                ));
-            }
+        if let Some(explicit_port) = url.port()
+            && Some(explicit_port) != default_port
+        {
+            return Err(ApiError::bad_request(
+                "url must use the default port for its scheme",
+            ));
         }
 
         url.set_fragment(None);

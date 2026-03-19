@@ -40,7 +40,7 @@ impl AuthRateLimiter {
             .lock()
             .expect("auth rate limiter mutex should not be poisoned");
         state.access_count += 1;
-        if state.access_count % CLEANUP_INTERVAL == 0 {
+        if state.access_count.is_multiple_of(CLEANUP_INTERVAL) {
             cleanup_buckets(&mut state.ip_buckets, now);
             cleanup_buckets(&mut state.email_buckets, now);
         }
