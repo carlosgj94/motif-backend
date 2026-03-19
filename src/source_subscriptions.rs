@@ -22,6 +22,10 @@ use crate::{
         timestamp_seconds,
     },
     error::{ApiError, ApiResult},
+    recommendations::{
+        InternalEventType, invoke_recommendation_processor, record_internal_content_event,
+        record_internal_source_event,
+    },
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
@@ -50,8 +54,24 @@ pub async fn create_source_subscription(
     let subscription_id =
         upsert_source_subscription(&mut transaction, user.user_id, source_id).await?;
 
+    let mut invoke_recommendations = false;
+    if existing_id.is_none() {
+        record_internal_source_event(
+            &mut transaction,
+            user.user_id,
+            source_id,
+            InternalEventType::Subscribe,
+            "source_subscriptions",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
     enqueue_source_refresh(&mut transaction, source_id, "subscribe", 0).await?;
     invoke_source_processor(&mut transaction, source_id, "subscribe").await?;
+    if invoke_recommendations {
+        invoke_recommendation_processor(&mut transaction, "subscribe").await?;
+    }
 
     transaction.commit().await.map_err(map_source_error)?;
 
@@ -120,21 +140,34 @@ pub async fn delete_source_subscription(
     State(state): State<AppState>,
     Path(subscription_id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    let mut transaction = state.pool.begin().await.map_err(map_source_error)?;
     let deleted = sqlx::query_scalar::<_, Uuid>(
         r#"
         delete from public.source_subscriptions
         where id = $1 and user_id = $2
-        returning id
+        returning source_id
         "#,
     )
     .bind(subscription_id)
     .bind(user.user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(map_source_error)?;
 
     match deleted {
-        Some(_) => Ok(StatusCode::NO_CONTENT),
+        Some(source_id) => {
+            record_internal_source_event(
+                &mut transaction,
+                user.user_id,
+                source_id,
+                InternalEventType::Unsubscribe,
+                "source_subscriptions",
+            )
+            .await?;
+            invoke_recommendation_processor(&mut transaction, "unsubscribe").await?;
+            transaction.commit().await.map_err(map_source_error)?;
+            Ok(StatusCode::NO_CONTENT)
+        }
         None => Err(ApiError::not_found("Source subscription was not found")),
     }
 }
@@ -354,8 +387,9 @@ pub async fn update_inbox_item(
     let mut transaction = state.pool.begin().await.map_err(map_source_error)?;
     let existing = sqlx::query_as::<_, InboxUpdateRow>(
         r#"
-        select read_state, dismissed_at, read_at
-        from public.subscription_inbox
+        select i.read_state, i.dismissed_at, i.read_at, i.content_id, c.source_id
+        from public.subscription_inbox i
+        join public.content c on c.id = i.content_id
         where id = $1 and user_id = $2
         "#,
     )
@@ -377,6 +411,8 @@ pub async fn update_inbox_item(
         ReadState::Read => existing.read_at.or_else(|| Some(OffsetDateTime::now_utc())),
         ReadState::Unread | ReadState::Reading => None,
     };
+    let became_dismissed = existing.dismissed_at.is_none() && next_dismissed_at.is_some();
+    let became_read = existing_read_state != ReadState::Read && next_read_state == ReadState::Read;
 
     sqlx::query(
         r#"
@@ -396,6 +432,37 @@ pub async fn update_inbox_item(
     .execute(&mut *transaction)
     .await
     .map_err(map_source_error)?;
+
+    let mut invoke_recommendations = false;
+    if became_dismissed {
+        record_internal_content_event(
+            &mut transaction,
+            user.user_id,
+            existing.content_id,
+            existing.source_id,
+            InternalEventType::Dismiss,
+            "inbox",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
+    if became_read {
+        record_internal_content_event(
+            &mut transaction,
+            user.user_id,
+            existing.content_id,
+            existing.source_id,
+            InternalEventType::MarkRead,
+            "inbox",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
+    if invoke_recommendations {
+        invoke_recommendation_processor(&mut transaction, "event").await?;
+    }
 
     transaction.commit().await.map_err(map_source_error)?;
 
@@ -1141,6 +1208,8 @@ struct InboxUpdateRow {
     read_state: String,
     dismissed_at: Option<OffsetDateTime>,
     read_at: Option<OffsetDateTime>,
+    content_id: Uuid,
+    source_id: Option<Uuid>,
 }
 
 #[derive(Clone, Copy)]

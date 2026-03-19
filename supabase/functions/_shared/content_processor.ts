@@ -124,6 +124,10 @@ interface ProcessedContent {
   coverImageUrl: string | null;
   favicon: FaviconResult | null;
   parsedDocument: Record<string, unknown>;
+  wordCount: number;
+  estimatedReadSeconds: number;
+  blockCount: number;
+  imageCount: number;
   httpStatus: number;
   fetchedAt: string;
 }
@@ -697,6 +701,7 @@ async function processArticleDocument(
     language_code: languageCode,
     blocks,
   }, baseUpdate);
+  const metrics = deriveParsedDocumentMetrics(parsedDocument);
 
   return {
     resolvedUrl: fetched.resolvedUrl,
@@ -711,6 +716,10 @@ async function processArticleDocument(
     coverImageUrl,
     favicon,
     parsedDocument,
+    wordCount: metrics.wordCount,
+    estimatedReadSeconds: metrics.estimatedReadSeconds,
+    blockCount: metrics.blockCount,
+    imageCount: metrics.imageCount,
     httpStatus: fetched.status,
     fetchedAt: fetched.fetchedAt,
   };
@@ -791,6 +800,7 @@ async function processXDocument(
     language_code: languageCode,
     blocks: sanitizedPosts,
   }, baseUpdate);
+  const metrics = deriveParsedDocumentMetrics(parsedDocument);
 
   return {
     resolvedUrl: fetched.resolvedUrl,
@@ -805,6 +815,10 @@ async function processXDocument(
     coverImageUrl,
     favicon,
     parsedDocument,
+    wordCount: metrics.wordCount,
+    estimatedReadSeconds: metrics.estimatedReadSeconds,
+    blockCount: metrics.blockCount,
+    imageCount: metrics.imageCount,
     httpStatus: fetched.status,
     fetchedAt: fetched.fetchedAt,
   };
@@ -831,6 +845,10 @@ async function persistSuccess(
     favicon_source_url: trimUrl(processed.favicon?.sourceUrl ?? null),
     favicon_fetched_at: processed.favicon?.fetchedAt ?? null,
     parsed_document: processed.parsedDocument,
+    word_count: processed.wordCount,
+    estimated_read_seconds: processed.estimatedReadSeconds,
+    block_count: processed.blockCount,
+    image_count: processed.imageCount,
     parsed_at: new Date().toISOString(),
     parser_name: PROCESSOR_NAME,
     parser_version: PROCESSOR_VERSION,
@@ -1533,6 +1551,72 @@ export function sanitizeParsedBlocks(blocks: ParsedBlock[]): ParsedBlock[] {
     .slice(0, maxParsedBlocks)
     .map((block) => sanitizeParsedBlock(block))
     .filter((block): block is ParsedBlock => block !== null);
+}
+
+function deriveParsedDocumentMetrics(parsedDocument: Record<string, unknown>): {
+  wordCount: number;
+  estimatedReadSeconds: number;
+  blockCount: number;
+  imageCount: number;
+} {
+  const blocks = Array.isArray(parsedDocument.blocks)
+    ? parsedDocument.blocks
+    : [];
+  let wordCount = 0;
+  let imageCount = 0;
+
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+
+    const blockRecord = block as Record<string, unknown>;
+    const blockType = typeof blockRecord.type === "string"
+      ? blockRecord.type
+      : null;
+    if (blockType === "image") {
+      imageCount += 1;
+    }
+
+    wordCount += countWordsInBlock(blockRecord);
+  }
+
+  return {
+    wordCount,
+    estimatedReadSeconds: Math.max(1, Math.ceil(wordCount / 220 * 60)),
+    blockCount: blocks.length,
+    imageCount,
+  };
+}
+
+function countWordsInBlock(block: Record<string, unknown>): number {
+  const texts: string[] = [];
+  const pushText = (value: unknown) => {
+    if (typeof value === "string" && value.trim().length > 0) {
+      texts.push(value);
+    }
+  };
+
+  pushText(block.text);
+  pushText(block.caption);
+  pushText(block.alt);
+  if (Array.isArray(block.items)) {
+    for (const item of block.items) {
+      pushText(item);
+    }
+  }
+
+  if (Array.isArray(block.media)) {
+    for (const media of block.media) {
+      if (media && typeof media === "object") {
+        pushText((media as Record<string, unknown>).alt);
+      }
+    }
+  }
+
+  return texts
+    .flatMap((text) => text.trim().split(/\s+/))
+    .filter((word) => word.length > 0).length;
 }
 
 function sanitizeParsedBlock(block: ParsedBlock): ParsedBlock | null {

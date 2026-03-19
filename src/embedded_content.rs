@@ -196,7 +196,10 @@ fn append_compact_content_blocks(value: &Value, out: &mut Vec<CompactContentBloc
     }
 }
 
-fn append_thread_post_blocks(block: &serde_json::Map<String, Value>, out: &mut Vec<CompactContentBlock>) {
+fn append_thread_post_blocks(
+    block: &serde_json::Map<String, Value>,
+    out: &mut Vec<CompactContentBlock>,
+) {
     if let Some(heading) = build_thread_post_heading(block) {
         out.push(CompactContentBlock::Heading {
             level: 3,

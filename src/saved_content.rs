@@ -25,6 +25,9 @@ use crate::{
         parse_optional_source_kind, timestamp_seconds,
     },
     error::{ApiError, ApiResult},
+    recommendations::{
+        InternalEventType, invoke_recommendation_processor, record_internal_content_event,
+    },
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
@@ -60,10 +63,28 @@ pub async fn save_saved_content(
         touch_saved_content(&mut transaction, saved_content_id).await?;
     }
 
+    let mut invoke_recommendations = false;
+    if existing_id.is_none() {
+        record_internal_content_event(
+            &mut transaction,
+            user.user_id,
+            content.id,
+            None,
+            InternalEventType::Save,
+            "saved_content",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
     let should_enqueue_processing = should_enqueue_content_processing(&content);
     if should_enqueue_processing {
         enqueue_content_processing(&mut transaction, content.id, "save", 0).await?;
         invoke_content_processor(&mut transaction, content.id, "save").await?;
+    }
+
+    if invoke_recommendations {
+        invoke_recommendation_processor(&mut transaction, "save").await?;
     }
 
     transaction
@@ -244,6 +265,8 @@ pub async fn update_saved_content(
             .or_else(|| Some(OffsetDateTime::now_utc())),
         ReadState::Unread | ReadState::Reading => None,
     };
+    let became_favorited = !existing.is_favorited && next_is_favorited;
+    let became_read = existing.read_state != ReadState::Read && next_read_state == ReadState::Read;
 
     apply_saved_content_update(
         &mut transaction,
@@ -259,6 +282,37 @@ pub async fn update_saved_content(
         replace_saved_content_tags(&mut transaction, user.user_id, saved_content_id, tag_slugs)
             .await?;
         touch_saved_content(&mut transaction, saved_content_id).await?;
+    }
+
+    let mut invoke_recommendations = false;
+    if became_favorited {
+        record_internal_content_event(
+            &mut transaction,
+            user.user_id,
+            existing.content_id,
+            None,
+            InternalEventType::Favorite,
+            "saved_content",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
+    if became_read {
+        record_internal_content_event(
+            &mut transaction,
+            user.user_id,
+            existing.content_id,
+            None,
+            InternalEventType::MarkRead,
+            "saved_content",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
+    if invoke_recommendations {
+        invoke_recommendation_processor(&mut transaction, "event").await?;
     }
 
     transaction
@@ -683,7 +737,7 @@ async fn fetch_saved_content_update_row(
 ) -> ApiResult<Option<SavedContentUpdateRow>> {
     sqlx::query_as::<_, SavedContentUpdateRowRaw>(
         r#"
-        select read_state, is_favorited, archived_at, read_completed_at
+        select read_state, is_favorited, archived_at, read_completed_at, content_id
         from public.saved_content
         where id = $1 and user_id = $2
         "#,
@@ -977,6 +1031,7 @@ fn build_saved_content_update_row(
         is_favorited: row.is_favorited,
         archived_at: row.archived_at,
         read_completed_at: row.read_completed_at,
+        content_id: row.content_id,
     })
 }
 
@@ -1301,6 +1356,7 @@ struct SavedContentUpdateRowRaw {
     is_favorited: bool,
     archived_at: Option<OffsetDateTime>,
     read_completed_at: Option<OffsetDateTime>,
+    content_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -1309,6 +1365,7 @@ struct SavedContentUpdateRow {
     is_favorited: bool,
     archived_at: Option<OffsetDateTime>,
     read_completed_at: Option<OffsetDateTime>,
+    content_id: Uuid,
 }
 
 #[derive(Debug, FromRow)]

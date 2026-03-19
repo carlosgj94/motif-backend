@@ -6,6 +6,7 @@ mod embedded_content;
 mod error;
 mod profile;
 mod rate_limit;
+mod recommendations;
 mod saved_content;
 mod source_subscriptions;
 
@@ -73,8 +74,28 @@ async fn main() {
         )
         .route("/me/tags", get(saved_content::list_content_tags))
         .route(
+            "/me/content/{content_id}",
+            get(recommendations::get_content_detail),
+        )
+        .route(
             "/me/content/{content_id}/favicon",
             get(saved_content::get_content_favicon),
+        )
+        .route(
+            "/me/recommendations/content",
+            get(recommendations::list_content_recommendations),
+        )
+        .route(
+            "/me/recommendations/sources",
+            get(recommendations::list_source_recommendations),
+        )
+        .route(
+            "/me/interaction-events/batch",
+            post(recommendations::ingest_interaction_events_batch),
+        )
+        .route(
+            "/me/recommendation-preferences",
+            put(recommendations::update_recommendation_preferences),
         )
         .route(
             "/me/source-subscriptions",

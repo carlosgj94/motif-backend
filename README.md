@@ -1,20 +1,64 @@
 # Motif Backend
 
-Rust API for authentication, saved content, and background URL processing.
+Rust API for authentication, saved content, subscriptions, inbox delivery, and recommendations.
 
 For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SETUP.md).
 
-## API Workflow
+## Basics
 
-This API is designed around bearer-token authenticated requests.
-
-- `POST /auth/session` creates a session for an email/password user.
+- `POST /auth/session` creates an email/password session.
 - All `/me/*` routes require `Authorization: Bearer <access_token>`.
-- `GET /me/saved-content` returns summary rows for the user library.
-- `GET /me/saved-content/{saved_content_id}` returns one saved record with the compact text body the device can render.
-- `POST /me/saved-content` saves a new URL and kicks background processing.
-- `POST /me/source-subscriptions` subscribes to a blog or source homepage.
-- `GET /me/inbox` returns subscription-delivered posts without auto-saving them.
+- Public response timestamps are Unix seconds.
+- Compact readable text is returned in `body.blocks`.
+- Favicons are fetched separately from `/me/content/{content_id}/favicon`.
+
+## Endpoint Index
+
+### Public
+
+- `GET /`
+- `GET /health`
+- `POST /auth/signup`
+- `POST /auth/session`
+- `GET /profiles/{username}`
+
+### Profile
+
+- `GET /me`
+- `PUT /me/profile`
+
+### Saved content
+
+- `POST /me/saved-content`
+- `GET /me/saved-content`
+- `GET /me/saved-content/{saved_content_id}`
+- `PATCH /me/saved-content/{saved_content_id}`
+- `DELETE /me/saved-content/{saved_content_id}`
+- `GET /me/tags`
+
+### Content
+
+- `GET /me/content/{content_id}`
+- `GET /me/content/{content_id}/favicon`
+
+### Source subscriptions
+
+- `POST /me/source-subscriptions`
+- `GET /me/source-subscriptions`
+- `DELETE /me/source-subscriptions/{subscription_id}`
+
+### Inbox
+
+- `GET /me/inbox`
+- `GET /me/inbox/{inbox_item_id}`
+- `PATCH /me/inbox/{inbox_item_id}`
+
+### Recommendations
+
+- `GET /me/recommendations/content`
+- `GET /me/recommendations/sources`
+- `PUT /me/recommendation-preferences`
+- `POST /me/interaction-events/batch`
 
 Use these examples with your own base URL:
 
@@ -24,9 +68,9 @@ EMAIL='user@example.com'
 PASSWORD='your-password'
 ```
 
-### 1. Optional: Create an email/password user
+## Common Flow
 
-If the user does not exist yet:
+### 1. Optional: create a user
 
 ```bash
 curl -sS -X POST "$API/auth/signup" \
@@ -35,12 +79,11 @@ curl -sS -X POST "$API/auth/signup" \
     "username": "reader01",
     "email": "'"$EMAIL"'",
     "password": "'"$PASSWORD"'"
-  }'
+  }' \
+  | jq
 ```
 
 ### 2. Create a session
-
-Get a bearer token:
 
 ```bash
 TOKEN=$(
@@ -54,19 +97,7 @@ TOKEN=$(
 )
 ```
 
-If your device already has a valid Supabase access token, you can skip this step and use that token directly.
-
-Optional sanity check:
-
-```bash
-curl -sS "$API/me" \
-  -H "Authorization: Bearer $TOKEN" \
-  | jq
-```
-
-### 3. Read the saved-content list
-
-This is the lightweight library view. It does not include the full article body.
+### 3. Fetch the library
 
 ```bash
 curl -sS "$API/me/saved-content?limit=20" \
@@ -74,91 +105,7 @@ curl -sS "$API/me/saved-content?limit=20" \
   | jq
 ```
 
-Example shape:
-
-```json
-{
-  "content": [
-    {
-      "id": "saved-content-id",
-      "submitted_url": "https://example.com/",
-      "read_state": "unread",
-      "is_favorited": false,
-      "created_at": 1773771640,
-      "updated_at": 1773771640,
-      "tags": [],
-      "content": {
-        "id": "content-id",
-        "canonical_url": "https://example.com/",
-        "host": "example.com",
-        "title": "Example Domain",
-        "excerpt": "This domain is for use in documentation examples...",
-        "has_favicon": false,
-        "fetch_status": "succeeded",
-        "parse_status": "succeeded"
-      }
-    }
-  ],
-  "next_cursor": null
-}
-```
-
-### 4. Read one saved article or thread
-
-Use the `saved_content_id` from the list response:
-
-```bash
-SAVED_CONTENT_ID='saved-content-id'
-
-curl -sS "$API/me/saved-content/$SAVED_CONTENT_ID" \
-  -H "Authorization: Bearer $TOKEN" \
-  | jq
-```
-
-The device-readable text is in:
-
-- `.content.body.kind`
-- `.content.body.blocks`
-
-Example detail shape:
-
-```json
-{
-  "id": "saved-content-id",
-  "submitted_url": "https://example.com/",
-  "read_state": "unread",
-  "is_favorited": false,
-  "created_at": 1773771640,
-  "updated_at": 1773771640,
-  "tags": [],
-  "content": {
-    "id": "content-id",
-    "canonical_url": "https://example.com/",
-    "resolved_url": "https://example.com/",
-    "host": "example.com",
-    "site_name": "example.com",
-    "source_kind": "article",
-    "title": "Example Domain",
-    "excerpt": "This domain is for use in documentation examples...",
-    "language_code": "en",
-    "has_favicon": false,
-    "fetch_status": "succeeded",
-    "parse_status": "succeeded",
-    "parsed_at": 1773771642,
-    "body": {
-      "kind": "article",
-      "blocks": [
-        { "t": "p", "x": "This domain is for use in documentation examples without needing permission. Avoid use in operations." },
-        { "t": "p", "x": "Learn more" }
-      ]
-    }
-  }
-}
-```
-
-### 5. Save a new article
-
-Submit a URL:
+### 4. Save a new URL
 
 ```bash
 curl -sS -X POST "$API/me/saved-content" \
@@ -171,92 +118,288 @@ curl -sS -X POST "$API/me/saved-content" \
   | jq
 ```
 
-The immediate response is a summary row. New saves usually start as:
-
-- `fetch_status: "pending"`
-- `parse_status: "pending"`
-
-Then the content processor fills in metadata and parsed text asynchronously.
-
-### 6. Poll until processing finishes
-
-After saving, keep calling the detail endpoint until the item reaches either:
-
-- `fetch_status: "succeeded"` and `parse_status: "succeeded"`
-- `fetch_status: "failed"` and `parse_status: "failed"`
-
-Example poll:
+### 5. Read one item
 
 ```bash
 SAVED_CONTENT_ID='saved-content-id'
 
 curl -sS "$API/me/saved-content/$SAVED_CONTENT_ID" \
   -H "Authorization: Bearer $TOKEN" \
-  | jq '{id, content: {fetch_status, parse_status, title, body}}'
+  | jq
 ```
 
-### 7. Optional: Read the favicon
+Readable content is in:
 
-If `has_favicon` is `true`, the summary/detail response will include:
+- `.content.body.kind`
+- `.content.body.blocks`
 
-- `favicon_href`, for example `/me/content/<content_id>/favicon`
+### 6. Fetch recommendations
 
-Fetch it like this:
+```bash
+curl -sS "$API/me/recommendations/content?limit=10" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+### 7. Report reading telemetry
+
+```bash
+SERVE_ID='recommendation-serve-id'
+CONTENT_ID='content-id'
+
+curl -sS -X POST "$API/me/interaction-events/batch" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {
+        "event_type": "open",
+        "content_id": "'"$CONTENT_ID"'",
+        "surface": "recommendations_content",
+        "serve_id": "'"$SERVE_ID"'",
+        "position": 0,
+        "occurred_at": 1774000000,
+        "client_event_id": "11111111-1111-1111-1111-111111111111"
+      },
+      {
+        "event_type": "heartbeat",
+        "content_id": "'"$CONTENT_ID"'",
+        "surface": "recommendations_content",
+        "serve_id": "'"$SERVE_ID"'",
+        "position": 0,
+        "visible_ms_delta": 15000,
+        "occurred_at": 1774000015,
+        "client_event_id": "22222222-2222-2222-2222-222222222222"
+      }
+    ]
+  }' \
+  | jq
+```
+
+## Endpoint Reference
+
+### Public routes
+
+#### `GET /`
+
+Health check.
+
+Example:
+
+```bash
+curl -sS "$API/" | jq
+```
+
+#### `GET /health`
+
+Health check.
+
+Example:
+
+```bash
+curl -sS "$API/health" | jq
+```
+
+#### `POST /auth/signup`
+
+Create an email/password user.
+
+Request body:
+
+```json
+{
+  "username": "reader01",
+  "email": "user@example.com",
+  "password": "your-password"
+}
+```
+
+#### `POST /auth/session`
+
+Create an email/password session.
+
+Request body:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "your-password"
+}
+```
+
+#### `GET /profiles/{username}`
+
+Get a public profile by username.
+
+Example:
+
+```bash
+curl -sS "$API/profiles/reader01" | jq
+```
+
+### Authenticated profile routes
+
+#### `GET /me`
+
+Return the current auth user plus optional profile row.
+
+Example:
+
+```bash
+curl -sS "$API/me" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+#### `PUT /me/profile`
+
+Create or update the user profile.
+
+Request body:
+
+```json
+{
+  "username": "reader01",
+  "display_name": "Reader 01",
+  "avatar_url": "https://example.com/avatar.png"
+}
+```
+
+### Authenticated saved-content routes
+
+#### `POST /me/saved-content`
+
+Save a URL to the user library and trigger background processing.
+
+Request body:
+
+```json
+{
+  "url": "https://cra.mr/optimizing-content-for-agents/",
+  "tag_slugs": ["technology"]
+}
+```
+
+#### `GET /me/saved-content`
+
+List saved content summaries.
+
+Query parameters:
+
+- `limit`
+- `cursor`
+- `read_state`
+- `favorited`
+- `archived`
+- `tag`
+
+Example:
+
+```bash
+curl -sS "$API/me/saved-content?limit=20&archived=false" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+#### `GET /me/saved-content/{saved_content_id}`
+
+Return one saved item with compact body text.
+
+Example:
+
+```bash
+curl -sS "$API/me/saved-content/$SAVED_CONTENT_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+#### `PATCH /me/saved-content/{saved_content_id}`
+
+Update saved-content state.
+
+Request body accepts any non-empty subset of:
+
+```json
+{
+  "read_state": "read",
+  "is_favorited": true,
+  "is_archived": false,
+  "tag_slugs": ["technology", "science"]
+}
+```
+
+#### `DELETE /me/saved-content/{saved_content_id}`
+
+Delete one saved-content row.
+
+Example:
+
+```bash
+curl -sS -X DELETE "$API/me/saved-content/$SAVED_CONTENT_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -i
+```
+
+#### `GET /me/tags`
+
+List system tags plus the user’s custom tags.
+
+Example:
+
+```bash
+curl -sS "$API/me/tags" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+### Authenticated content routes
+
+#### `GET /me/content/{content_id}`
+
+Return content by `content_id` without requiring it to already be saved. This is the main detail route for recommended content.
+
+Example:
 
 ```bash
 CONTENT_ID='content-id'
 
+curl -sS "$API/me/content/$CONTENT_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+#### `GET /me/content/{content_id}/favicon`
+
+Return favicon bytes for a content row when available.
+
+Example:
+
+```bash
 curl -sS "$API/me/content/$CONTENT_ID/favicon" \
   -H "Authorization: Bearer $TOKEN" \
   --output favicon.bin
 ```
 
-## Minimal Embedded Flow
+### Authenticated source subscription routes
 
-For a low-resource device, the normal flow is:
+#### `POST /me/source-subscriptions`
 
-1. Create a session with `POST /auth/session`.
-2. Call `GET /me/saved-content` to show the library.
-3. Call `GET /me/saved-content/{saved_content_id}` only when the user opens one item.
-4. Read `content.body.blocks` and render that compact text representation.
-5. Use `POST /me/saved-content` when the user saves a new URL.
+Subscribe to a source homepage. `feed_url` is optional.
 
-## Source Subscription Flow
-
-Subscriptions are source-level, not article-level. A subscription discovers a feed, refreshes it in the background, and delivers matching posts to the user inbox.
-
-### 1. Subscribe to a source
-
-Submit a source homepage URL. `feed_url` is optional and only needed when discovery should skip homepage parsing.
-
-```bash
-curl -sS -X POST "$API/me/source-subscriptions" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "source_url": "https://cra.mr/"
-  }' \
-  | jq
-```
-
-Example shape:
+Request body:
 
 ```json
 {
-  "id": "source-subscription-id",
-  "created_at": 1773771700,
-  "updated_at": 1773771700,
-  "source": {
-    "id": "source-id",
-    "source_url": "https://cra.mr/",
-    "host": "cra.mr",
-    "source_kind": "website",
-    "refresh_status": "pending"
-  }
+  "source_url": "https://cra.mr/",
+  "feed_url": "https://cra.mr/feed.xml"
 }
 ```
 
-### 2. List subscriptions
+#### `GET /me/source-subscriptions`
+
+List current source subscriptions.
+
+Example:
 
 ```bash
 curl -sS "$API/me/source-subscriptions" \
@@ -264,9 +407,35 @@ curl -sS "$API/me/source-subscriptions" \
   | jq
 ```
 
-### 3. Read the inbox
+#### `DELETE /me/source-subscriptions/{subscription_id}`
 
-The inbox is summary-only and separate from `saved-content`.
+Unsubscribe from a source. Existing inbox rows are kept.
+
+Example:
+
+```bash
+SUBSCRIPTION_ID='source-subscription-id'
+
+curl -sS -X DELETE "$API/me/source-subscriptions/$SUBSCRIPTION_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -i
+```
+
+### Authenticated inbox routes
+
+#### `GET /me/inbox`
+
+List subscription-delivered posts.
+
+Query parameters:
+
+- `limit`
+- `cursor`
+- `read_state`
+- `dismissed`
+- `subscription_id`
+
+Example:
 
 ```bash
 curl -sS "$API/me/inbox?limit=20" \
@@ -274,42 +443,11 @@ curl -sS "$API/me/inbox?limit=20" \
   | jq
 ```
 
-Example shape:
+#### `GET /me/inbox/{inbox_item_id}`
 
-```json
-{
-  "inbox": [
-    {
-      "id": "inbox-item-id",
-      "subscription_id": "source-subscription-id",
-      "delivered_at": 1773771800,
-      "read_state": "unread",
-      "is_saved": false,
-      "source": {
-        "id": "source-id",
-        "source_url": "https://cra.mr/",
-        "host": "cra.mr",
-        "title": "CRA",
-        "primary_feed_url": "https://cra.mr/feed.xml",
-        "refresh_status": "succeeded"
-      },
-      "content": {
-        "id": "content-id",
-        "canonical_url": "https://cra.mr/optimizing-content-for-agents/",
-        "host": "cra.mr",
-        "title": "Optimizing Content for Agents",
-        "fetch_status": "succeeded",
-        "parse_status": "succeeded"
-      }
-    }
-  ],
-  "next_cursor": null
-}
-```
+Return one inbox item with the same compact body contract used by saved content.
 
-### 4. Read one inbox item
-
-The detail response uses the same compact text contract as saved content.
+Example:
 
 ```bash
 INBOX_ITEM_ID='inbox-item-id'
@@ -319,28 +457,152 @@ curl -sS "$API/me/inbox/$INBOX_ITEM_ID" \
   | jq
 ```
 
-### 5. Update inbox state
+#### `PATCH /me/inbox/{inbox_item_id}`
+
+Update inbox state.
+
+Request body accepts any non-empty subset of:
+
+```json
+{
+  "read_state": "read",
+  "is_dismissed": true
+}
+```
+
+### Authenticated recommendation routes
+
+#### `GET /me/recommendations/content`
+
+Return a ranked content feed plus a `serve_id` for telemetry attribution.
+
+Query parameters:
+
+- `limit`
+
+Example:
 
 ```bash
-curl -sS -X PATCH "$API/me/inbox/$INBOX_ITEM_ID" \
+curl -sS "$API/me/recommendations/content?limit=10" \
   -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "read_state": "read",
-    "is_dismissed": false
-  }' \
   | jq
 ```
 
-### 6. Unsubscribe
+Example shape:
 
-This stops future deliveries but keeps already delivered inbox rows.
+```json
+{
+  "serve_id": "recommendation-serve-id",
+  "content": [
+    {
+      "position": 0,
+      "is_saved": false,
+      "is_subscribed_source": true,
+      "content": {
+        "id": "content-id",
+        "canonical_url": "https://example.com/article",
+        "host": "example.com",
+        "title": "Example Article",
+        "has_favicon": true,
+        "favicon_href": "/me/content/content-id/favicon",
+        "fetch_status": "succeeded",
+        "parse_status": "succeeded"
+      },
+      "source": {
+        "id": "source-id",
+        "source_url": "https://example.com/",
+        "host": "example.com",
+        "title": "Example Source"
+      }
+    }
+  ]
+}
+```
+
+#### `GET /me/recommendations/sources`
+
+Return ranked source suggestions plus a `serve_id`.
+
+Query parameters:
+
+- `limit`
+
+Example:
 
 ```bash
-SUBSCRIPTION_ID='source-subscription-id'
-
-curl -sS -X DELETE "$API/me/source-subscriptions/$SUBSCRIPTION_ID" \
+curl -sS "$API/me/recommendations/sources?limit=10" \
   -H "Authorization: Bearer $TOKEN" \
-  -i
+  | jq
 ```
-6. Poll the detail endpoint until processing completes.
+
+#### `PUT /me/recommendation-preferences`
+
+Set onboarding-style recommendation preferences.
+
+Request body:
+
+```json
+{
+  "topic_slugs": ["technology", "science"],
+  "language_codes": ["en"]
+}
+```
+
+#### `POST /me/interaction-events/batch`
+
+Batch-read telemetry for recommendations or other surfaces.
+
+Request body:
+
+```json
+{
+  "events": [
+    {
+      "event_type": "impression",
+      "content_id": "content-id",
+      "surface": "recommendations_content",
+      "serve_id": "recommendation-serve-id",
+      "position": 0,
+      "occurred_at": 1774000000,
+      "client_event_id": "11111111-1111-1111-1111-111111111111"
+    },
+    {
+      "event_type": "heartbeat",
+      "content_id": "content-id",
+      "surface": "recommendations_content",
+      "serve_id": "recommendation-serve-id",
+      "position": 0,
+      "visible_ms_delta": 15000,
+      "occurred_at": 1774000015,
+      "client_event_id": "22222222-2222-2222-2222-222222222222"
+    }
+  ]
+}
+```
+
+Supported public event types:
+
+- `impression`
+- `open`
+- `heartbeat`
+- `close`
+- `dismiss`
+
+Event fields:
+
+- `content_id` or `source_id` is required
+- `client_event_id` is required
+- `heartbeat` requires `visible_ms_delta`
+- `surface`, `session_id`, `serve_id`, `position`, `occurred_at`, and `metadata` are optional
+
+## Notes For Device Clients
+
+- Use list endpoints for summary views and detail endpoints only when the user opens one item.
+- The compact body contract is intentionally minimal:
+  - heading: `{ "t": "h", "l": 2, "x": "Heading" }`
+  - paragraph: `{ "t": "p", "x": "Paragraph text" }`
+  - quote: `{ "t": "q", "x": "Quoted text" }`
+  - list: `{ "t": "l", "o": false, "i": ["A", "B"] }`
+  - code: `{ "t": "c", "x": "code", "lang": "rust" }`
+- Processing is asynchronous. Newly saved or newly delivered content can be `pending` before text is ready.
+- Recommendation telemetry should be batched instead of sent one request per event.
