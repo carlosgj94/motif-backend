@@ -29,6 +29,7 @@ const MAX_RECOMMENDATION_LIMIT: u32 = 50;
 const MAX_BATCH_EVENT_COUNT: usize = 50;
 const MAX_TOPIC_PREFERENCES: usize = 16;
 const MAX_LANGUAGE_PREFERENCES: usize = 8;
+const IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT: i32 = 10_000;
 const RECOMMENDATION_ALGORITHM_VERSION: &str = "v1-postgres-hybrid";
 
 pub async fn list_content_recommendations(
@@ -38,92 +39,25 @@ pub async fn list_content_recommendations(
 ) -> ApiResult<Json<ContentRecommendationListResponse>> {
     let limit = normalize_recommendation_limit(query.limit)?;
     let user_context = load_user_recommendation_context(&state.pool, user.user_id).await?;
+    let candidate_rows =
+        fetch_content_recommendation_candidate_rows(&state.pool, user.user_id).await?;
 
-    let mut candidates = HashMap::new();
-    collect_content_candidates(
-        &mut candidates,
-        fetch_subscribed_content_candidates(&state.pool, user.user_id).await?,
-        ContentCandidateBucket::SubscribedInbox,
-    );
-    collect_content_candidates(
-        &mut candidates,
-        fetch_discovery_content_candidates(
-            &state.pool,
-            user.user_id,
-            &user_context.preferred_languages,
-        )
-        .await?,
-        ContentCandidateBucket::Discovery,
-    );
-    collect_content_candidates(
-        &mut candidates,
-        fetch_saved_adjacent_content_candidates(
-            &state.pool,
-            user.user_id,
-            &user_context.top_topic_ids,
-            &user_context.top_source_ids,
-        )
-        .await?,
-        ContentCandidateBucket::SavedAdjacent,
-    );
-    collect_content_candidates(
-        &mut candidates,
-        fetch_trending_content_candidates(
-            &state.pool,
-            user.user_id,
-            &user_context.preferred_languages,
-        )
-        .await?,
-        ContentCandidateBucket::Trending,
-    );
-
-    let candidate_ids: Vec<Uuid> = candidates.keys().copied().collect();
-    let content_rows = fetch_recommendation_content_rows(&state.pool, &candidate_ids).await?;
-    let content_ids: Vec<Uuid> = content_rows.iter().map(|row| row.content_id).collect();
-    let source_ids: Vec<Uuid> = content_rows
-        .iter()
-        .filter_map(|row| row.source_id)
-        .collect();
-
-    let topic_scores = fetch_content_topic_scores(&state.pool, user.user_id, &content_ids).await?;
-    let source_affinity_scores =
-        fetch_user_source_affinity_scores(&state.pool, user.user_id, &source_ids).await?;
-    let content_halos = fetch_recent_content_halos(&state.pool, &content_ids, 30).await?;
-    let source_halos = fetch_recent_source_halos(&state.pool, &source_ids, 30).await?;
-    let feedback_map =
-        fetch_user_content_feedback_scores(&state.pool, user.user_id, &content_ids).await?;
-
-    let mut scored = content_rows
+    let mut scored = candidate_rows
         .into_iter()
         .filter_map(|row| {
-            let content_id = row.content_id;
-            let source_id = row.source_id;
-            let buckets = candidates.remove(&content_id)?;
-            if feedback_map
-                .get(&content_id)
-                .is_some_and(|feedback| feedback.dismiss_count > 0)
-            {
+            if row.dismiss_count > 0 {
                 return None;
             }
 
-            let topic_match = topic_scores
-                .get(&content_id)
-                .map(|score| normalize_positive_score(score.score))
-                .unwrap_or(0.0);
-            let source_affinity = source_id
-                .and_then(|value| source_affinity_scores.get(&value).copied())
-                .map(normalize_positive_score)
-                .unwrap_or(0.0);
-            let content_halo = content_halos.get(&content_id).copied().unwrap_or(0.0);
-            let source_halo = source_id
-                .and_then(|value| source_halos.get(&value).copied())
-                .unwrap_or(0.0);
+            let topic_match = normalize_positive_score(row.topic_score);
+            let source_affinity = normalize_positive_score(row.source_affinity_score);
+            let content_halo = row.content_halo_score;
+            let source_halo = row.source_halo_score;
             let freshness = freshness_score(row.published_at.unwrap_or(row.created_at), 30.0);
-            let subscribed_inbox_boost = if user_context
-                .subscribed_source_ids
-                .contains(&source_id.unwrap_or(Uuid::nil()))
-                || buckets.subscribed_inbox
-            {
+            let subscribed_inbox_boost = if row.subscribed_inbox
+                || row.source_id.is_some_and(|source_id| {
+                    user_context.subscribed_source_ids.contains(&source_id)
+                }) {
                 1.0
             } else {
                 0.0
@@ -133,10 +67,7 @@ pub async fn list_content_recommendations(
             } else {
                 0.0
             };
-            let repeat_penalty = feedback_map
-                .get(&content_id)
-                .map(repeat_penalty)
-                .unwrap_or(0.0);
+            let repeat_penalty = repeat_penalty(&row);
             let final_score = (0.30 * topic_match)
                 + (0.20 * source_affinity)
                 + (0.15 * content_halo)
@@ -145,12 +76,17 @@ pub async fn list_content_recommendations(
                 + (0.10 * subscribed_inbox_boost)
                 + (0.05 * exploration_boost)
                 - repeat_penalty;
+            let primary_topic_slug = row.primary_topic_slug.clone();
+            let bucket_breakdown = json!({
+                "subscribed_inbox": row.subscribed_inbox,
+                "discovery": row.discovery,
+                "saved_adjacent": row.saved_adjacent,
+                "trending": row.trending,
+            });
 
             Some(ScoredContentCandidate {
                 row,
-                primary_topic_slug: topic_scores
-                    .get(&content_id)
-                    .and_then(|score| score.primary_topic_slug.clone()),
+                primary_topic_slug,
                 score: final_score.max(0.0),
                 score_breakdown: json!({
                     "topic_affinity": topic_match,
@@ -161,7 +97,7 @@ pub async fn list_content_recommendations(
                     "subscribed_inbox_boost": subscribed_inbox_boost,
                     "exploration_boost": exploration_boost,
                     "repeat_penalty": repeat_penalty,
-                    "buckets": buckets.to_json(),
+                    "buckets": bucket_breakdown,
                 }),
             })
         })
@@ -199,58 +135,27 @@ pub async fn list_source_recommendations(
 ) -> ApiResult<Json<SourceRecommendationListResponse>> {
     let limit = normalize_recommendation_limit(query.limit)?;
     let user_context = load_user_recommendation_context(&state.pool, user.user_id).await?;
-
-    let mut candidate_ids = HashSet::new();
-    candidate_ids
-        .extend(fetch_topic_source_candidates(&state.pool, &user_context.top_topic_ids).await?);
-    candidate_ids.extend(
-        fetch_recent_source_candidates(
-            &state.pool,
-            user.user_id,
-            &user_context.preferred_languages,
-        )
-        .await?,
-    );
-    candidate_ids.extend(
-        fetch_similar_source_candidates(&state.pool, user.user_id, &user_context.top_source_ids)
-            .await?,
-    );
-    for subscribed in &user_context.subscribed_source_ids {
-        candidate_ids.remove(subscribed);
-    }
-
-    let source_ids: Vec<Uuid> = candidate_ids.into_iter().collect();
-    let source_rows = fetch_recommendation_source_rows(&state.pool, &source_ids).await?;
-    let topic_scores = fetch_source_topic_scores(&state.pool, user.user_id, &source_ids).await?;
-    let source_halos = fetch_recent_source_halos(&state.pool, &source_ids, 30).await?;
-    let recent_activity = fetch_source_recent_activity(&state.pool, &source_ids, 30).await?;
-    let similarity_scores =
-        fetch_source_similarity_scores(&state.pool, user.user_id, &source_ids).await?;
+    let source_rows = fetch_source_recommendation_candidate_rows(&state.pool, user.user_id).await?;
 
     let mut scored = source_rows
         .into_iter()
+        .filter(|row| !user_context.subscribed_source_ids.contains(&row.source_id))
         .map(|row| {
-            let source_id = row.source_id;
-            let topic_match = topic_scores
-                .get(&source_id)
-                .map(|score| normalize_positive_score(score.score))
-                .unwrap_or(0.0);
-            let source_halo = source_halos.get(&source_id).copied().unwrap_or(0.0);
-            let recent_activity_score =
-                normalize_recent_activity(recent_activity.get(&source_id).copied().unwrap_or(0));
-            let similarity = similarity_scores.get(&source_id).copied().unwrap_or(0.0);
+            let topic_match = normalize_positive_score(row.topic_score);
+            let source_halo = row.source_halo_score;
+            let recent_activity_score = normalize_recent_activity(row.recent_activity_count);
+            let similarity = row.similarity_score;
             let exploration_diversity = 1.0;
             let final_score = (0.40 * topic_match)
                 + (0.20 * source_halo)
                 + (0.15 * similarity)
                 + (0.15 * recent_activity_score)
                 + (0.10 * exploration_diversity);
+            let primary_topic_slug = row.primary_topic_slug.clone();
 
             ScoredSourceCandidate {
                 row,
-                primary_topic_slug: topic_scores
-                    .get(&source_id)
-                    .and_then(|score| score.primary_topic_slug.clone()),
+                primary_topic_slug,
                 score: final_score.max(0.0),
                 score_breakdown: json!({
                     "topic_match": topic_match,
@@ -343,8 +248,6 @@ pub async fn ingest_interaction_events_batch(
     let mut transaction = state.pool.begin().await.map_err(map_recommendation_error)?;
     let inserted =
         insert_public_interaction_events(&mut transaction, user.user_id, &events).await?;
-    enqueue_public_interaction_refreshes(&mut transaction, user.user_id, &events).await?;
-    invoke_recommendation_processor(&mut transaction, "event").await?;
     transaction
         .commit()
         .await
@@ -410,16 +313,7 @@ pub async fn update_recommendation_preferences(
             .map_err(map_recommendation_error)?;
     }
 
-    enqueue_recommendation_refresh(
-        &mut transaction,
-        Some(user.user_id),
-        None,
-        None,
-        "preferences",
-        0,
-    )
-    .await?;
-    invoke_recommendation_processor(&mut transaction, "preferences").await?;
+    refresh_recommendation_targets(&mut transaction, Some(user.user_id), None, None).await?;
     transaction
         .commit()
         .await
@@ -463,15 +357,7 @@ pub(crate) async fn record_internal_content_event(
     .await
     .map_err(map_recommendation_error)?;
 
-    enqueue_recommendation_refresh(
-        transaction,
-        Some(user_id),
-        Some(content_id),
-        source_id,
-        event_type.default_trigger(),
-        0,
-    )
-    .await
+    Ok(())
 }
 
 pub(crate) async fn record_internal_source_event(
@@ -503,63 +389,51 @@ pub(crate) async fn record_internal_source_event(
     .await
     .map_err(map_recommendation_error)?;
 
-    enqueue_recommendation_refresh(
-        transaction,
-        Some(user_id),
-        None,
-        Some(source_id),
-        event_type.default_trigger(),
-        0,
-    )
-    .await
-}
-
-pub(crate) async fn invoke_recommendation_processor(
-    transaction: &mut Transaction<'_, Postgres>,
-    trigger: &str,
-) -> ApiResult<()> {
-    let job_id = sqlx::query_scalar::<_, Option<i64>>(
-        r#"
-        select public.invoke_recommendation_processor(
-            jsonb_build_object('trigger', $1)
-        )
-        "#,
-    )
-    .bind(trigger)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    if job_id.is_none() {
-        tracing::warn!(
-            trigger,
-            "recommendation processor invoke skipped because required Vault secrets are missing",
-        );
-    }
-
     Ok(())
 }
 
-async fn enqueue_recommendation_refresh(
+pub(crate) async fn sync_recommendation_targets_for_signal(
     transaction: &mut Transaction<'_, Postgres>,
     user_id: Option<Uuid>,
     content_id: Option<Uuid>,
     source_id: Option<Uuid>,
-    trigger: &str,
-    delay_seconds: i32,
 ) -> ApiResult<()> {
-    sqlx::query_scalar::<_, i64>(
+    rollup_interaction_events(transaction, IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT).await?;
+    refresh_recommendation_targets(transaction, user_id, content_id, source_id).await
+}
+
+pub(crate) async fn refresh_recommendation_targets(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Option<Uuid>,
+    content_id: Option<Uuid>,
+    source_id: Option<Uuid>,
+) -> ApiResult<()> {
+    sqlx::query(
         r#"
-        select public.enqueue_recommendation_refresh($1, $2, $3, $4, $5, $6)
+        select public.refresh_recommendation_targets($1, $2, $3)
         "#,
     )
     .bind(user_id)
     .bind(content_id)
     .bind(source_id)
-    .bind(trigger)
-    .bind(delay_seconds)
-    .bind(0_i32)
-    .fetch_one(&mut **transaction)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_recommendation_error)?;
+
+    Ok(())
+}
+
+async fn rollup_interaction_events(
+    transaction: &mut Transaction<'_, Postgres>,
+    limit: i32,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        select public.rollup_interaction_events($1)
+        "#,
+    )
+    .bind(limit)
+    .execute(&mut **transaction)
     .await
     .map_err(map_recommendation_error)?;
 
@@ -570,112 +444,34 @@ async fn load_user_recommendation_context(
     pool: &PgPool,
     user_id: Uuid,
 ) -> ApiResult<UserRecommendationContext> {
-    let preferred_languages = sqlx::query_scalar::<_, Vec<String>>(
+    let row = sqlx::query_as::<_, RecommendationContextRow>(
         r#"
-        select preferred_languages
-        from public.user_recommendation_settings
-        where user_id = $1
+        select *
+        from public.get_user_recommendation_context($1)
         "#,
     )
     .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(map_recommendation_error)?
-    .unwrap_or_default();
-
-    let subscribed_source_ids = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        select source_id
-        from public.source_subscriptions
-        where user_id = $1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?
-    .into_iter()
-    .collect::<HashSet<_>>();
-
-    let top_topic_ids = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        select topic_id
-        from public.user_topic_affinity
-        where user_id = $1 and score > 0
-        order by score desc, topic_id asc
-        limit 10
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    let top_source_ids = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        select source_id
-        from public.user_source_affinity
-        where user_id = $1 and score > 0
-        order by score desc, source_id asc
-        limit 10
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await
     .map_err(map_recommendation_error)?;
 
     Ok(UserRecommendationContext {
-        preferred_languages,
-        subscribed_source_ids,
-        top_topic_ids,
-        top_source_ids,
+        preferred_languages: row.preferred_languages,
+        subscribed_source_ids: row
+            .subscribed_source_ids
+            .into_iter()
+            .collect::<HashSet<_>>(),
     })
 }
 
-fn collect_content_candidates(
-    out: &mut HashMap<Uuid, ContentCandidateBuckets>,
-    rows: Vec<RecommendationContentSeedRow>,
-    bucket: ContentCandidateBucket,
-) {
-    for row in rows {
-        out.entry(row.content_id)
-            .and_modify(|existing| existing.merge_bucket(bucket))
-            .or_insert_with(|| ContentCandidateBuckets::from_bucket(bucket));
-    }
-}
-
-async fn fetch_subscribed_content_candidates(
+async fn fetch_content_recommendation_candidate_rows(
     pool: &PgPool,
     user_id: Uuid,
-) -> ApiResult<Vec<RecommendationContentSeedRow>> {
-    sqlx::query_as::<_, RecommendationContentSeedRow>(
+) -> ApiResult<Vec<RecommendationContentCandidateRow>> {
+    sqlx::query_as::<_, RecommendationContentCandidateRow>(
         r#"
-        select distinct
-            i.content_id
-        from public.subscription_inbox i
-        join public.content c on c.id = i.content_id
-        where i.user_id = $1
-          and i.dismissed_at is null
-          and c.parse_status = 'succeeded'
-          and c.parsed_document is not null
-          and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '30 days'
-          and not exists (
-              select 1
-              from public.saved_content sc
-              where sc.user_id = $1
-                and sc.content_id = i.content_id
-                and sc.archived_at is null
-          )
-          and not exists (
-              select 1
-              from public.user_content_feedback ucf
-              where ucf.user_id = $1
-                and ucf.content_id = i.content_id
-                and ucf.dismiss_count > 0
-          )
-        order by i.content_id
-        limit 200
+        select *
+        from public.get_content_recommendation_candidates($1)
         "#,
     )
     .bind(user_id)
@@ -684,640 +480,20 @@ async fn fetch_subscribed_content_candidates(
     .map_err(map_recommendation_error)
 }
 
-async fn fetch_discovery_content_candidates(
+async fn fetch_source_recommendation_candidate_rows(
     pool: &PgPool,
     user_id: Uuid,
-    preferred_languages: &[String],
-) -> ApiResult<Vec<RecommendationContentSeedRow>> {
-    sqlx::query_as::<_, RecommendationContentSeedRow>(
+) -> ApiResult<Vec<RecommendationSourceCandidateRow>> {
+    sqlx::query_as::<_, RecommendationSourceCandidateRow>(
         r#"
-        select
-            c.id as content_id
-        from public.content c
-        where c.parse_status = 'succeeded'
-          and c.parsed_document is not null
-          and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '30 days'
-          and not exists (
-              select 1
-              from public.source_subscriptions ss
-              where ss.user_id = $1
-                and ss.source_id = c.source_id
-          )
-          and not exists (
-              select 1
-              from public.saved_content sc
-              where sc.user_id = $1
-                and sc.content_id = c.id
-                and sc.archived_at is null
-          )
-          and not exists (
-              select 1
-              from public.user_content_feedback ucf
-              where ucf.user_id = $1
-                and ucf.content_id = c.id
-                and ucf.dismiss_count > 0
-          )
-          and (
-              cardinality($2::text[]) = 0
-              or c.language_code is null
-              or c.language_code = any($2)
-          )
-        order by coalesce(c.published_at, c.created_at) desc, c.id desc
-        limit 200
+        select *
+        from public.get_source_recommendation_candidates($1)
         "#,
     )
     .bind(user_id)
-    .bind(preferred_languages)
     .fetch_all(pool)
     .await
     .map_err(map_recommendation_error)
-}
-
-async fn fetch_saved_adjacent_content_candidates(
-    pool: &PgPool,
-    user_id: Uuid,
-    topic_ids: &[Uuid],
-    source_ids: &[Uuid],
-) -> ApiResult<Vec<RecommendationContentSeedRow>> {
-    if topic_ids.is_empty() && source_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query_as::<_, RecommendationContentSeedRow>(
-        r#"
-        select distinct
-            c.id as content_id
-        from public.content c
-        where c.parse_status = 'succeeded'
-          and c.parsed_document is not null
-          and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '60 days'
-          and (
-              (
-                  cardinality($2::uuid[]) > 0
-                  and (
-                      exists (
-                          select 1
-                          from public.content_topics ct
-                          where ct.content_id = c.id
-                            and ct.topic_id = any($2)
-                      )
-                      or exists (
-                          select 1
-                          from public.source_topics st
-                          where st.source_id = c.source_id
-                            and st.topic_id = any($2)
-                      )
-                  )
-              )
-              or (
-                  cardinality($3::uuid[]) > 0
-                  and c.source_id = any($3)
-              )
-          )
-          and not exists (
-              select 1
-              from public.saved_content sc
-              where sc.user_id = $1
-                and sc.content_id = c.id
-                and sc.archived_at is null
-          )
-          and not exists (
-              select 1
-              from public.user_content_feedback ucf
-              where ucf.user_id = $1
-                and ucf.content_id = c.id
-                and ucf.dismiss_count > 0
-          )
-        order by coalesce(c.published_at, c.created_at) desc, c.id desc
-        limit 200
-        "#,
-    )
-    .bind(user_id)
-    .bind(topic_ids)
-    .bind(source_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_trending_content_candidates(
-    pool: &PgPool,
-    user_id: Uuid,
-    preferred_languages: &[String],
-) -> ApiResult<Vec<RecommendationContentSeedRow>> {
-    sqlx::query_as::<_, RecommendationContentSeedRow>(
-        r#"
-        with halo as (
-            select
-                content_id,
-                avg(score) as average_score
-            from public.content_halo_daily
-            where halo_date >= current_date - 14
-            group by content_id
-        )
-        select
-            c.id as content_id
-        from halo
-        join public.content c on c.id = halo.content_id
-        where c.parse_status = 'succeeded'
-          and c.parsed_document is not null
-          and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '14 days'
-          and not exists (
-              select 1
-              from public.saved_content sc
-              where sc.user_id = $1
-                and sc.content_id = c.id
-                and sc.archived_at is null
-          )
-          and not exists (
-              select 1
-              from public.user_content_feedback ucf
-              where ucf.user_id = $1
-                and ucf.content_id = c.id
-                and ucf.dismiss_count > 0
-          )
-          and (
-              cardinality($2::text[]) = 0
-              or c.language_code is null
-              or c.language_code = any($2)
-          )
-        order by halo.average_score desc, coalesce(c.published_at, c.created_at) desc
-        limit 200
-        "#,
-    )
-    .bind(user_id)
-    .bind(preferred_languages)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_recommendation_content_rows(
-    pool: &PgPool,
-    content_ids: &[Uuid],
-) -> ApiResult<Vec<RecommendationContentRow>> {
-    if content_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query_as::<_, RecommendationContentRow>(
-        r#"
-        select
-            c.id as content_id,
-            c.source_id,
-            c.canonical_url,
-            c.resolved_url,
-            c.host,
-            c.site_name,
-            c.source_kind,
-            c.title,
-            c.excerpt,
-            c.author,
-            c.published_at,
-            c.language_code,
-            (c.favicon_bytes is not null and c.favicon_mime_type is not null) as has_favicon,
-            c.fetch_status,
-            c.parse_status,
-            c.parsed_at,
-            c.created_at,
-            cs.source_url,
-            cs.resolved_source_url,
-            cs.host as source_host,
-            cs.title as source_title,
-            cs.source_kind as source_kind_label,
-            sf.feed_url as primary_feed_url
-        from public.content c
-        left join public.content_sources cs on cs.id = c.source_id
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = c.source_id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
-        where c.id = any($1)
-        "#,
-    )
-    .bind(content_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_content_topic_scores(
-    pool: &PgPool,
-    user_id: Uuid,
-    content_ids: &[Uuid],
-) -> ApiResult<HashMap<Uuid, TopicScore>> {
-    if content_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, TopicScoreRow>(
-        r#"
-        with topic_matches as (
-            select
-                ct.content_id,
-                t.slug,
-                greatest(uta.score, 0) * ct.confidence as weighted_score
-            from public.content_topics ct
-            join public.user_topic_affinity uta
-              on uta.topic_id = ct.topic_id
-             and uta.user_id = $1
-            join public.topics t on t.id = ct.topic_id
-            where ct.content_id = any($2)
-
-            union all
-
-            select
-                c.id as content_id,
-                t.slug,
-                greatest(uta.score, 0) * st.confidence * 0.75 as weighted_score
-            from public.content c
-            join public.source_topics st on st.source_id = c.source_id
-            join public.user_topic_affinity uta
-              on uta.topic_id = st.topic_id
-             and uta.user_id = $1
-            join public.topics t on t.id = st.topic_id
-            where c.id = any($2)
-        )
-        select
-            content_id,
-            max(weighted_score) as score,
-            (array_agg(slug order by weighted_score desc, slug asc))[1] as primary_topic_slug
-        from topic_matches
-        group by content_id
-        "#,
-    )
-    .bind(user_id)
-    .bind(content_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.id,
-                TopicScore {
-                    score: row.score,
-                    primary_topic_slug: row.primary_topic_slug,
-                },
-            )
-        })
-        .collect())
-}
-
-async fn fetch_user_source_affinity_scores(
-    pool: &PgPool,
-    user_id: Uuid,
-    source_ids: &[Uuid],
-) -> ApiResult<HashMap<Uuid, f64>> {
-    if source_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, SourceScoreRow>(
-        r#"
-        select source_id, score
-        from public.user_source_affinity
-        where user_id = $1
-          and source_id = any($2)
-        "#,
-    )
-    .bind(user_id)
-    .bind(source_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows.into_iter().map(|row| (row.id, row.score)).collect())
-}
-
-async fn fetch_recent_content_halos(
-    pool: &PgPool,
-    content_ids: &[Uuid],
-    days: i32,
-) -> ApiResult<HashMap<Uuid, f64>> {
-    if content_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, SourceScoreRow>(
-        r#"
-        select content_id as source_id, avg(score) as score
-        from public.content_halo_daily
-        where content_id = any($1)
-          and halo_date >= current_date - $2
-        group by content_id
-        "#,
-    )
-    .bind(content_ids)
-    .bind(days)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows.into_iter().map(|row| (row.id, row.score)).collect())
-}
-
-async fn fetch_recent_source_halos(
-    pool: &PgPool,
-    source_ids: &[Uuid],
-    days: i32,
-) -> ApiResult<HashMap<Uuid, f64>> {
-    if source_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, SourceScoreRow>(
-        r#"
-        select source_id, avg(score) as score
-        from public.source_halo_daily
-        where source_id = any($1)
-          and halo_date >= current_date - $2
-        group by source_id
-        "#,
-    )
-    .bind(source_ids)
-    .bind(days)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows.into_iter().map(|row| (row.id, row.score)).collect())
-}
-
-async fn fetch_user_content_feedback_scores(
-    pool: &PgPool,
-    user_id: Uuid,
-    content_ids: &[Uuid],
-) -> ApiResult<HashMap<Uuid, UserContentFeedbackRow>> {
-    if content_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, UserContentFeedbackRow>(
-        r#"
-        select
-            content_id,
-            dismiss_count,
-            mark_read_count,
-            read_ratio
-        from public.user_content_feedback
-        where user_id = $1
-          and content_id = any($2)
-        "#,
-    )
-    .bind(user_id)
-    .bind(content_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows.into_iter().map(|row| (row.content_id, row)).collect())
-}
-
-async fn fetch_topic_source_candidates(pool: &PgPool, topic_ids: &[Uuid]) -> ApiResult<Vec<Uuid>> {
-    if topic_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query_scalar::<_, Uuid>(
-        r#"
-        select distinct st.source_id
-        from public.source_topics st
-        where st.topic_id = any($1)
-        limit 200
-        "#,
-    )
-    .bind(topic_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_recent_source_candidates(
-    pool: &PgPool,
-    user_id: Uuid,
-    preferred_languages: &[String],
-) -> ApiResult<Vec<Uuid>> {
-    sqlx::query_scalar::<_, Uuid>(
-        r#"
-        select distinct c.source_id
-        from public.content c
-        where c.source_id is not null
-          and c.parse_status = 'succeeded'
-          and c.parsed_document is not null
-          and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '30 days'
-          and not exists (
-              select 1
-              from public.source_subscriptions ss
-              where ss.user_id = $1
-                and ss.source_id = c.source_id
-          )
-          and (
-              cardinality($2::text[]) = 0
-              or c.language_code is null
-              or c.language_code = any($2)
-          )
-        order by c.source_id
-        limit 200
-        "#,
-    )
-    .bind(user_id)
-    .bind(preferred_languages)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_similar_source_candidates(
-    pool: &PgPool,
-    user_id: Uuid,
-    source_ids: &[Uuid],
-) -> ApiResult<Vec<Uuid>> {
-    if source_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query_scalar::<_, Uuid>(
-        r#"
-        with engaged_topics as (
-            select distinct st.topic_id
-            from public.user_source_affinity usa
-            join public.source_topics st on st.source_id = usa.source_id
-            where usa.user_id = $1
-              and usa.score > 0
-        )
-        select distinct st.source_id
-        from public.source_topics st
-        join engaged_topics et on et.topic_id = st.topic_id
-        where st.source_id <> all($2)
-        limit 200
-        "#,
-    )
-    .bind(user_id)
-    .bind(source_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_recommendation_source_rows(
-    pool: &PgPool,
-    source_ids: &[Uuid],
-) -> ApiResult<Vec<RecommendationSourceRow>> {
-    if source_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    sqlx::query_as::<_, RecommendationSourceRow>(
-        r#"
-        select
-            cs.id as source_id,
-            cs.source_url,
-            cs.resolved_source_url,
-            cs.host as source_host,
-            cs.title as source_title,
-            cs.description as source_description,
-            cs.source_kind,
-            cs.refresh_status,
-            cs.last_refreshed_at,
-            sf.feed_url as primary_feed_url
-        from public.content_sources cs
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = cs.id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
-        where cs.id = any($1)
-        "#,
-    )
-    .bind(source_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)
-}
-
-async fn fetch_source_topic_scores(
-    pool: &PgPool,
-    user_id: Uuid,
-    source_ids: &[Uuid],
-) -> ApiResult<HashMap<Uuid, TopicScore>> {
-    if source_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, TopicScoreRow>(
-        r#"
-        select
-            st.source_id as content_id,
-            max(greatest(uta.score, 0) * st.confidence) as score,
-            (array_agg(t.slug order by greatest(uta.score, 0) * st.confidence desc, t.slug asc))[1] as primary_topic_slug
-        from public.source_topics st
-        join public.user_topic_affinity uta
-          on uta.topic_id = st.topic_id
-         and uta.user_id = $1
-        join public.topics t on t.id = st.topic_id
-        where st.source_id = any($2)
-        group by st.source_id
-        "#,
-    )
-    .bind(user_id)
-    .bind(source_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.id,
-                TopicScore {
-                    score: row.score,
-                    primary_topic_slug: row.primary_topic_slug,
-                },
-            )
-        })
-        .collect())
-}
-
-async fn fetch_source_recent_activity(
-    pool: &PgPool,
-    source_ids: &[Uuid],
-    days: i32,
-) -> ApiResult<HashMap<Uuid, i64>> {
-    if source_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, SourceActivityRow>(
-        r#"
-        select source_id, count(*)::bigint as activity_count
-        from public.content
-        where source_id = any($1)
-          and parse_status = 'succeeded'
-          and parsed_document is not null
-          and coalesce(published_at, created_at) >= timezone('utc', now()) - make_interval(days => greatest($2, 1))
-        group by source_id
-        "#,
-    )
-    .bind(source_ids)
-    .bind(days)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.source_id, row.activity_count))
-        .collect())
-}
-
-async fn fetch_source_similarity_scores(
-    pool: &PgPool,
-    user_id: Uuid,
-    source_ids: &[Uuid],
-) -> ApiResult<HashMap<Uuid, f64>> {
-    if source_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query_as::<_, SourceScoreRow>(
-        r#"
-        with engaged_topics as (
-            select
-                st.topic_id,
-                max(greatest(usa.score, 0)) as affinity_score
-            from public.user_source_affinity usa
-            join public.source_topics st on st.source_id = usa.source_id
-            where usa.user_id = $1
-              and usa.score > 0
-            group by st.topic_id
-        )
-        select
-            st.source_id,
-            coalesce(avg(least(et.affinity_score * st.confidence, 2.0)), 0) as score
-        from public.source_topics st
-        join engaged_topics et on et.topic_id = st.topic_id
-        where st.source_id = any($2)
-        group by st.source_id
-        "#,
-    )
-    .bind(user_id)
-    .bind(source_ids)
-    .fetch_all(pool)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    Ok(rows.into_iter().map(|row| (row.id, row.score)).collect())
 }
 
 async fn persist_content_recommendation_serve(
@@ -1462,12 +638,16 @@ fn build_content_recommendation_item(
         .source_id
         .map(|source_id| RecommendationSourcePreview {
             id: source_id,
-        source_url: candidate.row.source_url.clone(),
-        resolved_source_url: candidate.row.resolved_source_url.clone(),
-        host: candidate.row.source_host.clone().unwrap_or_else(|| candidate.row.host.clone()),
-        title: candidate.row.source_title.clone(),
-        source_kind,
-        primary_feed_url: candidate.row.primary_feed_url.clone(),
+            source_url: candidate.row.source_url.clone(),
+            resolved_source_url: candidate.row.resolved_source_url.clone(),
+            host: candidate
+                .row
+                .source_host
+                .clone()
+                .unwrap_or_else(|| candidate.row.host.clone()),
+            title: candidate.row.source_title.clone(),
+            source_kind,
+            primary_feed_url: candidate.row.primary_feed_url.clone(),
         });
 
     Ok(ContentRecommendationItem {
@@ -1607,31 +787,6 @@ async fn insert_public_interaction_events(
         .map_err(map_recommendation_error)?;
 
     Ok(result.rows_affected() as u32)
-}
-
-async fn enqueue_public_interaction_refreshes(
-    transaction: &mut Transaction<'_, Postgres>,
-    user_id: Uuid,
-    events: &[ValidatedInteractionEvent],
-) -> ApiResult<()> {
-    let mut unique_targets = HashSet::new();
-    for event in events {
-        unique_targets.insert((event.content_id, event.source_id));
-    }
-
-    for (content_id, source_id) in unique_targets {
-        enqueue_recommendation_refresh(
-            transaction,
-            Some(user_id),
-            content_id,
-            source_id,
-            "event",
-            0,
-        )
-        .await?;
-    }
-
-    Ok(())
 }
 
 async fn validate_public_interaction_targets(
@@ -1925,8 +1080,8 @@ fn normalize_recent_activity(activity_count: i64) -> f64 {
     (activity_count as f64).clamp(0.0, 20.0) / 20.0
 }
 
-fn repeat_penalty(feedback: &UserContentFeedbackRow) -> f64 {
-    if feedback.mark_read_count > 0 || feedback.read_ratio >= 0.8 {
+fn repeat_penalty(candidate: &RecommendationContentCandidateRow) -> f64 {
+    if candidate.mark_read_count > 0 || candidate.read_ratio >= 0.8 {
         0.35
     } else {
         0.0
@@ -2175,15 +1330,6 @@ impl InternalEventType {
             Self::Dismiss => "dismiss",
         }
     }
-
-    const fn default_trigger(self) -> &'static str {
-        match self {
-            Self::Save => "save",
-            Self::Subscribe => "subscribe",
-            Self::Unsubscribe => "unsubscribe",
-            Self::Favorite | Self::MarkRead | Self::Dismiss => "event",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2221,55 +1367,11 @@ struct ValidatedInteractionEvent {
 struct UserRecommendationContext {
     preferred_languages: Vec<String>,
     subscribed_source_ids: HashSet<Uuid>,
-    top_topic_ids: Vec<Uuid>,
-    top_source_ids: Vec<Uuid>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ContentCandidateBucket {
-    SubscribedInbox,
-    Discovery,
-    SavedAdjacent,
-    Trending,
-}
-
-#[derive(Debug, Default)]
-struct ContentCandidateBuckets {
-    subscribed_inbox: bool,
-    discovery: bool,
-    saved_adjacent: bool,
-    trending: bool,
-}
-
-impl ContentCandidateBuckets {
-    fn from_bucket(bucket: ContentCandidateBucket) -> Self {
-        let mut value = Self::default();
-        value.merge_bucket(bucket);
-        value
-    }
-
-    fn merge_bucket(&mut self, bucket: ContentCandidateBucket) {
-        match bucket {
-            ContentCandidateBucket::SubscribedInbox => self.subscribed_inbox = true,
-            ContentCandidateBucket::Discovery => self.discovery = true,
-            ContentCandidateBucket::SavedAdjacent => self.saved_adjacent = true,
-            ContentCandidateBucket::Trending => self.trending = true,
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "subscribed_inbox": self.subscribed_inbox,
-            "discovery": self.discovery,
-            "saved_adjacent": self.saved_adjacent,
-            "trending": self.trending,
-        })
-    }
 }
 
 #[derive(Debug)]
 struct ScoredContentCandidate {
-    row: RecommendationContentRow,
+    row: RecommendationContentCandidateRow,
     primary_topic_slug: Option<String>,
     score: f64,
     score_breakdown: Value,
@@ -2277,35 +1379,30 @@ struct ScoredContentCandidate {
 
 #[derive(Debug)]
 struct ScoredSourceCandidate {
-    row: RecommendationSourceRow,
+    row: RecommendationSourceCandidateRow,
     primary_topic_slug: Option<String>,
     score: f64,
     score_breakdown: Value,
 }
 
-#[derive(Debug)]
-struct TopicScore {
-    score: f64,
-    primary_topic_slug: Option<String>,
+#[derive(Debug, FromRow)]
+struct RecommendationContextRow {
+    preferred_languages: Vec<String>,
+    subscribed_source_ids: Vec<Uuid>,
+    #[sqlx(rename = "top_topic_ids")]
+    _top_topic_ids: Vec<Uuid>,
+    #[sqlx(rename = "top_source_ids")]
+    _top_source_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, FromRow)]
-struct TopicScoreRow {
-    #[sqlx(rename = "content_id")]
-    id: Uuid,
-    score: f64,
-    primary_topic_slug: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct RecommendationContentSeedRow {
-    content_id: Uuid,
-}
-
-#[derive(Debug, FromRow)]
-struct RecommendationContentRow {
+struct RecommendationContentCandidateRow {
     content_id: Uuid,
     source_id: Option<Uuid>,
+    subscribed_inbox: bool,
+    discovery: bool,
+    saved_adjacent: bool,
+    trending: bool,
     canonical_url: String,
     resolved_url: Option<String>,
     host: String,
@@ -2327,10 +1424,18 @@ struct RecommendationContentRow {
     source_title: Option<String>,
     source_kind_label: Option<String>,
     primary_feed_url: Option<String>,
+    topic_score: f64,
+    primary_topic_slug: Option<String>,
+    source_affinity_score: f64,
+    content_halo_score: f64,
+    source_halo_score: f64,
+    dismiss_count: i32,
+    mark_read_count: i32,
+    read_ratio: f64,
 }
 
 #[derive(Debug, FromRow)]
-struct RecommendationSourceRow {
+struct RecommendationSourceCandidateRow {
     source_id: Uuid,
     source_url: String,
     resolved_source_url: Option<String>,
@@ -2341,6 +1446,11 @@ struct RecommendationSourceRow {
     refresh_status: String,
     last_refreshed_at: Option<OffsetDateTime>,
     primary_feed_url: Option<String>,
+    topic_score: f64,
+    primary_topic_slug: Option<String>,
+    source_halo_score: f64,
+    recent_activity_count: i64,
+    similarity_score: f64,
 }
 
 #[derive(Debug, FromRow)]
@@ -2364,27 +1474,6 @@ struct RecommendationContentDetailRow {
 }
 
 #[derive(Debug, FromRow)]
-struct SourceScoreRow {
-    #[sqlx(rename = "source_id")]
-    id: Uuid,
-    score: f64,
-}
-
-#[derive(Debug, FromRow)]
-struct SourceActivityRow {
-    source_id: Uuid,
-    activity_count: i64,
-}
-
-#[derive(Debug, FromRow)]
-struct UserContentFeedbackRow {
-    content_id: Uuid,
-    dismiss_count: i32,
-    mark_read_count: i32,
-    read_ratio: f64,
-}
-
-#[derive(Debug, FromRow)]
 struct TopicRow {
     id: Uuid,
 }
@@ -2392,7 +1481,6 @@ struct TopicRow {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentCandidateBucket, ContentCandidateBuckets, InternalEventType,
         PublicInteractionEventType, freshness_score, normalize_language_codes,
         normalize_positive_score, normalize_topic_slugs, validate_public_interaction_event,
     };
@@ -2445,22 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn bucket_json_reflects_merged_state() {
-        let mut buckets = ContentCandidateBuckets::from_bucket(ContentCandidateBucket::Discovery);
-        buckets.merge_bucket(ContentCandidateBucket::Trending);
-
-        assert_eq!(
-            buckets.to_json(),
-            json!({
-                "subscribed_inbox": false,
-                "discovery": true,
-                "saved_adjacent": false,
-                "trending": true,
-            })
-        );
-    }
-
-    #[test]
     fn positive_score_normalization_clamps() {
         assert_eq!(normalize_positive_score(-1.0), 0.0);
         assert_eq!(normalize_positive_score(0.5), 0.25);
@@ -2472,12 +1544,5 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         assert!(freshness_score(now, 30.0) > 0.99);
         assert_eq!(freshness_score(now - time::Duration::days(45), 30.0), 0.0);
-    }
-
-    #[test]
-    fn internal_event_triggers_match_expected_routes() {
-        assert_eq!(InternalEventType::Save.default_trigger(), "save");
-        assert_eq!(InternalEventType::Subscribe.default_trigger(), "subscribe");
-        assert_eq!(InternalEventType::Favorite.default_trigger(), "event");
     }
 }

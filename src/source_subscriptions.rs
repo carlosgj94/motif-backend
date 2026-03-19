@@ -23,8 +23,8 @@ use crate::{
     },
     error::{ApiError, ApiResult},
     recommendations::{
-        InternalEventType, invoke_recommendation_processor, record_internal_content_event,
-        record_internal_source_event,
+        InternalEventType, record_internal_content_event, record_internal_source_event,
+        sync_recommendation_targets_for_signal,
     },
 };
 
@@ -70,7 +70,13 @@ pub async fn create_source_subscription(
     enqueue_source_refresh(&mut transaction, source_id, "subscribe", 0).await?;
     invoke_source_processor(&mut transaction, source_id, "subscribe").await?;
     if invoke_recommendations {
-        invoke_recommendation_processor(&mut transaction, "subscribe").await?;
+        sync_recommendation_targets_for_signal(
+            &mut transaction,
+            Some(user.user_id),
+            None,
+            Some(source_id),
+        )
+        .await?;
     }
 
     transaction.commit().await.map_err(map_source_error)?;
@@ -110,14 +116,7 @@ pub async fn list_source_subscriptions(
             sf.feed_url as primary_feed_url
         from public.source_subscriptions ss
         join public.content_sources cs on cs.id = ss.source_id
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = cs.id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
         where ss.user_id = $1
         order by ss.updated_at desc, ss.id desc
         "#,
@@ -164,7 +163,13 @@ pub async fn delete_source_subscription(
                 "source_subscriptions",
             )
             .await?;
-            invoke_recommendation_processor(&mut transaction, "unsubscribe").await?;
+            sync_recommendation_targets_for_signal(
+                &mut transaction,
+                Some(user.user_id),
+                None,
+                Some(source_id),
+            )
+            .await?;
             transaction.commit().await.map_err(map_source_error)?;
             Ok(StatusCode::NO_CONTENT)
         }
@@ -233,14 +238,7 @@ pub async fn list_inbox(
         from public.subscription_inbox i
         join public.source_subscriptions ss on ss.id = i.subscription_id
         join public.content_sources cs on cs.id = ss.source_id
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = cs.id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
         join public.content c on c.id = i.content_id
         where i.user_id =
         "#,
@@ -350,14 +348,7 @@ pub async fn get_inbox_item(
         from public.subscription_inbox i
         join public.source_subscriptions ss on ss.id = i.subscription_id
         join public.content_sources cs on cs.id = ss.source_id
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = cs.id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
         join public.content c on c.id = i.content_id
         where i.id = $1
           and i.user_id = $2
@@ -461,7 +452,13 @@ pub async fn update_inbox_item(
     }
 
     if invoke_recommendations {
-        invoke_recommendation_processor(&mut transaction, "event").await?;
+        sync_recommendation_targets_for_signal(
+            &mut transaction,
+            Some(user.user_id),
+            Some(existing.content_id),
+            existing.source_id,
+        )
+        .await?;
     }
 
     transaction.commit().await.map_err(map_source_error)?;
@@ -671,14 +668,7 @@ async fn fetch_source_subscription_summary(
             sf.feed_url as primary_feed_url
         from public.source_subscriptions ss
         join public.content_sources cs on cs.id = ss.source_id
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = cs.id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
         where ss.id = $1 and ss.user_id = $2
         "#,
     )
@@ -740,14 +730,7 @@ async fn fetch_inbox_summary(
         from public.subscription_inbox i
         join public.source_subscriptions ss on ss.id = i.subscription_id
         join public.content_sources cs on cs.id = ss.source_id
-        left join lateral (
-            select feed_url
-            from public.source_feeds
-            where source_id = cs.id
-              and is_primary
-            order by created_at asc
-            limit 1
-        ) sf on true
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
         join public.content c on c.id = i.content_id
         where i.id = $1
           and i.user_id = $2

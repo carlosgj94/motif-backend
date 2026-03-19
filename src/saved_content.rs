@@ -26,7 +26,7 @@ use crate::{
     },
     error::{ApiError, ApiResult},
     recommendations::{
-        InternalEventType, invoke_recommendation_processor, record_internal_content_event,
+        InternalEventType, record_internal_content_event, sync_recommendation_targets_for_signal,
     },
 };
 
@@ -84,7 +84,13 @@ pub async fn save_saved_content(
     }
 
     if invoke_recommendations {
-        invoke_recommendation_processor(&mut transaction, "save").await?;
+        sync_recommendation_targets_for_signal(
+            &mut transaction,
+            Some(user.user_id),
+            Some(content.id),
+            None,
+        )
+        .await?;
     }
 
     transaction
@@ -312,7 +318,13 @@ pub async fn update_saved_content(
     }
 
     if invoke_recommendations {
-        invoke_recommendation_processor(&mut transaction, "event").await?;
+        sync_recommendation_targets_for_signal(
+            &mut transaction,
+            Some(user.user_id),
+            Some(existing.content_id),
+            None,
+        )
+        .await?;
     }
 
     transaction
@@ -357,19 +369,24 @@ pub async fn list_content_tags(
 ) -> ApiResult<Json<ContentTagListResponse>> {
     let rows = sqlx::query_as::<_, TagSummaryRow>(
         r#"
+        with user_tag_counts as (
+            select
+                sct.tag_id,
+                count(*)::bigint as content_count
+            from public.saved_content sc
+            join public.saved_content_tags sct on sct.saved_content_id = sc.id
+            where sc.user_id = $1
+            group by sct.tag_id
+        )
         select
             t.id,
             t.slug,
             t.label,
             t.scope,
-            count(sc.id)::bigint as content_count
+            coalesce(utc.content_count, 0)::bigint as content_count
         from public.tags t
-        left join public.saved_content_tags sct on sct.tag_id = t.id
-        left join public.saved_content sc
-            on sc.id = sct.saved_content_id
-           and sc.user_id = $1
+        left join user_tag_counts utc on utc.tag_id = t.id
         where t.owner_user_id is null or t.owner_user_id = $1
-        group by t.id, t.slug, t.label, t.scope, t.owner_user_id
         order by
             case when t.owner_user_id is null then 0 else 1 end,
             t.label asc

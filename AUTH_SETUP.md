@@ -132,3 +132,20 @@ select vault.create_secret('<same-secret-as-edge-function>', 'content_processor_
 Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit. `pg_cron` also invokes the same function every minute as a recovery path.
 
 Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, `publishable_key`, and `content_processor_secret` values.
+
+## Recommendation rollups
+
+Recommendation aggregation no longer uses a separate Supabase Edge Function.
+
+- Raw recommendation telemetry is stored in `public.interaction_events`.
+- The database migration creates Postgres-native rollup jobs with `pg_cron`.
+- `public.rollup_interaction_events(...)` runs on an hourly schedule.
+- `public.refresh_dirty_recommendation_aggregates(...)` runs on a daily schedule.
+- Explicit user actions such as saves, favorites, mark-read events, and subscriptions are refreshed synchronously by the Rust API.
+
+If you want to backfill the current dev database immediately after deploying the migration, run:
+
+```sql
+select public.rollup_interaction_events(50000);
+select public.refresh_dirty_recommendation_aggregates(5000, 5000, 5000);
+```
