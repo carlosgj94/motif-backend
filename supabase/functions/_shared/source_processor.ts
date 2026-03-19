@@ -1041,6 +1041,7 @@ async function enqueueContentProcessingForUrls(
       p_content_id: row.id,
       p_trigger: "retry",
       p_delay_seconds: 0,
+      p_retry_count: 0,
     });
     if (error) {
       throw new Error(
