@@ -15,6 +15,22 @@ const TRACKING_QUERY_PARAMS: &[&str] = &[
 ];
 
 const TRACKING_QUERY_PREFIXES: &[&str] = &["utm_"];
+const NON_DISCOVERABLE_SOURCE_HOSTS: &[&str] = &[
+    "x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "www.x.com",
+    "mobile.twitter.com",
+    "reddit.com",
+    "www.reddit.com",
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "medium.com",
+    "www.medium.com",
+    "linkedin.com",
+    "www.linkedin.com",
+];
 
 pub const SEEDED_SYSTEM_TAGS: &[&str] = &[
     "technology",
@@ -109,6 +125,35 @@ impl NormalizedUrl {
             canonical_url: url.into(),
             host,
         })
+    }
+
+    pub fn source_discovery_candidate(&self) -> ApiResult<Option<Self>> {
+        if NON_DISCOVERABLE_SOURCE_HOSTS.contains(&self.host.as_str()) {
+            return Ok(None);
+        }
+
+        let mut url = Url::parse(&self.canonical_url)
+            .map_err(|_| ApiError::internal("normalized URL was invalid"))?;
+        url.set_path("/");
+        url.set_query(None);
+        url.set_fragment(None);
+
+        let default_port = match url.scheme() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        };
+        if default_port == url.port() {
+            let _ = url.set_port(None);
+        }
+
+        let canonical_url: String = url.into();
+
+        Ok(Some(Self {
+            submitted_url: canonical_url.clone(),
+            canonical_url,
+            host: self.host.clone(),
+        }))
     }
 }
 
@@ -421,6 +466,33 @@ mod tests {
     #[test]
     fn rejects_non_default_ports() {
         assert!(NormalizedUrl::parse("https://example.com:444/posts").is_err());
+    }
+
+    #[test]
+    fn derives_root_source_candidate_for_article_urls() {
+        let normalized = NormalizedUrl::parse("https://example.com/posts/hello-world?id=42")
+            .expect("url should parse");
+
+        let candidate = normalized
+            .source_discovery_candidate()
+            .expect("candidate should be derived")
+            .expect("candidate should exist");
+
+        assert_eq!(candidate.host, "example.com");
+        assert_eq!(candidate.canonical_url, "https://example.com/");
+    }
+
+    #[test]
+    fn skips_source_discovery_for_shared_social_hosts() {
+        let normalized = NormalizedUrl::parse("https://x.com/OpenAI/status/1894583079404277864")
+            .expect("url should parse");
+
+        assert!(
+            normalized
+                .source_discovery_candidate()
+                .expect("candidate generation should succeed")
+                .is_none()
+        );
     }
 
     #[test]

@@ -91,7 +91,7 @@ The database migrations now expect these managed extensions to be available:
 
 - `pgmq` for the durable queue
 - `pg_net` for the immediate post-commit function trigger
-- `pg_cron` for the once-per-minute recovery trigger
+- `pg_cron` for recovery triggers
 
 ### Edge Function
 
@@ -151,9 +151,9 @@ select vault.create_secret('<your-publishable-key>', 'publishable_key');
 select vault.create_secret('<same-secret-as-edge-function>', 'content_processor_secret');
 ```
 
-Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit. `pg_cron` also invokes the same function every minute as a recovery path.
+Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit. `pg_cron` also invokes the content processor every minute as a recovery path.
 
-Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, `publishable_key`, and `content_processor_secret` values.
+Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, `publishable_key`, and `content_processor_secret` values. The source refresh recovery cron now runs every 30 minutes.
 
 ## Recommendation rollups
 

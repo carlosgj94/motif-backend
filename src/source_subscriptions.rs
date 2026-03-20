@@ -469,7 +469,7 @@ pub async fn update_inbox_item(
     Ok(Json(summary))
 }
 
-async fn get_or_create_source(
+pub(crate) async fn get_or_create_source(
     transaction: &mut Transaction<'_, Postgres>,
     source_url: &NormalizedUrl,
 ) -> ApiResult<Uuid> {
@@ -590,7 +590,7 @@ async fn upsert_source_subscription(
     .map_err(map_source_error)
 }
 
-async fn enqueue_source_refresh(
+pub(crate) async fn enqueue_source_refresh(
     transaction: &mut Transaction<'_, Postgres>,
     source_id: Uuid,
     trigger: &str,
@@ -612,7 +612,7 @@ async fn enqueue_source_refresh(
     Ok(())
 }
 
-async fn invoke_source_processor(
+pub(crate) async fn invoke_source_processor(
     transaction: &mut Transaction<'_, Postgres>,
     source_id: Uuid,
     trigger: &str,

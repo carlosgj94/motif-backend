@@ -28,6 +28,7 @@ use crate::{
     recommendations::{
         InternalEventType, record_internal_content_event, sync_recommendation_targets_for_signal,
     },
+    source_subscriptions::{enqueue_source_refresh, get_or_create_source, invoke_source_processor},
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
@@ -97,6 +98,8 @@ pub async fn save_saved_content(
         .commit()
         .await
         .map_err(map_saved_content_error)?;
+
+    attempt_source_discovery_for_saved_content(&state.pool, &normalized_url, content.id).await;
 
     let summary = fetch_saved_content_summary(&state.pool, user.user_id, saved_content_id)
         .await?
@@ -471,6 +474,93 @@ async fn get_or_create_content(
     .map_err(map_saved_content_error)
 }
 
+async fn attempt_source_discovery_for_saved_content(
+    pool: &PgPool,
+    normalized_url: &NormalizedUrl,
+    content_id: Uuid,
+) {
+    let attempt = async {
+        let mut transaction = pool.begin().await.map_err(map_saved_content_error)?;
+        let source_id = load_linked_source_id(&mut transaction, content_id).await?;
+
+        let source_id = match source_id {
+            Some(source_id) => source_id,
+            None => {
+                let Some(source_candidate) = normalized_url.source_discovery_candidate()? else {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(map_saved_content_error)?;
+                    return Ok(());
+                };
+
+                let source_id = get_or_create_source(&mut transaction, &source_candidate).await?;
+                link_content_to_source(&mut transaction, content_id, source_id).await?;
+                source_id
+            }
+        };
+
+        enqueue_source_refresh(&mut transaction, source_id, "save", 0).await?;
+        invoke_source_processor(&mut transaction, source_id, "save").await?;
+        transaction
+            .commit()
+            .await
+            .map_err(map_saved_content_error)?;
+
+        Ok::<(), ApiError>(())
+    }
+    .await;
+
+    if let Err(error) = attempt {
+        tracing::warn!(
+            %content_id,
+            url = %normalized_url.canonical_url,
+            ?error,
+            "saved-content source discovery attempt failed",
+        );
+    }
+}
+
+async fn load_linked_source_id(
+    transaction: &mut Transaction<'_, Postgres>,
+    content_id: Uuid,
+) -> ApiResult<Option<Uuid>> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select source_id
+        from public.content
+        where id = $1
+          and source_id is not null
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_saved_content_error)
+}
+
+async fn link_content_to_source(
+    transaction: &mut Transaction<'_, Postgres>,
+    content_id: Uuid,
+    source_id: Uuid,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        update public.content
+        set source_id = $2,
+            updated_at = timezone('utc', now())
+        where id = $1
+          and source_id is null
+        "#,
+    )
+    .bind(content_id)
+    .bind(source_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_saved_content_error)?;
+
+    Ok(())
+}
 async fn enqueue_content_processing(
     transaction: &mut Transaction<'_, Postgres>,
     content_id: Uuid,
