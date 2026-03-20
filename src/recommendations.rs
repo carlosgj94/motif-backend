@@ -2368,4 +2368,126 @@ mod tests {
         assert_eq!(value[0]["subtopics"][0]["slug"], "programming");
         assert!(value[1].get("subtopics").is_none());
     }
+
+    #[tokio::test]
+    async fn database_backed_source_candidate_tables_accept_reviews() {
+        let pool = connect_test_database().await;
+        let candidate_id = unique_test_uuid(1);
+        let normalized_url = format!("https://candidate-{candidate_id}.example.com/");
+        let host = format!("candidate-{candidate_id}.example.com");
+
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        sqlx::query(
+            r#"
+            insert into public.source_candidates (
+                id,
+                submitted_url,
+                normalized_url,
+                source_url,
+                host,
+                provenance,
+                discovery_depth,
+                topic_hint_slugs,
+                status
+            )
+            values ($1, $2, $2, $2, $3, 'seed', 0, ARRAY['technology']::text[], 'pending')
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(&normalized_url)
+        .bind(&host)
+        .execute(&mut *transaction)
+        .await
+        .expect("candidate should insert");
+
+        sqlx::query(
+            r#"
+            insert into public.source_candidate_reviews (
+                candidate_id,
+                decision,
+                sampled_posts,
+                inferred_topics,
+                rubric,
+                overall_quality_tier,
+                summary,
+                review_provider,
+                review_model
+            )
+            values (
+                $1,
+                'approve',
+                '[{"url":"https://example.com/post","excerpt":"Strong writing"}]'::jsonb,
+                '[{"slug":"technology","confidence":0.9}]'::jsonb,
+                '{"topical_focus":4,"rigor_credibility":4,"originality_insight":4,"freshness_activity":4,"signal_to_noise":4}'::jsonb,
+                4,
+                'A strong source.',
+                'test',
+                'test-model'
+            )
+            "#,
+        )
+        .bind(candidate_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("candidate review should insert");
+
+        let review_count = sqlx::query_scalar::<_, i64>(
+            "select count(*) from public.source_candidate_reviews where candidate_id = $1",
+        )
+        .bind(candidate_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("review count should fetch");
+
+        assert_eq!(review_count, 1);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn database_backed_source_refresh_queue_accepts_seed_trigger() {
+        let pool = connect_test_database().await;
+        let source_id = unique_test_uuid(2);
+        let source_url = format!("https://seed-trigger-{source_id}.example.com/");
+        let host = format!("seed-trigger-{source_id}.example.com");
+
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        sqlx::query(
+            r#"
+            insert into public.content_sources (
+                id,
+                source_url,
+                host,
+                source_kind,
+                refresh_status
+            )
+            values ($1, $2, $3, 'website', 'pending')
+            "#,
+        )
+        .bind(source_id)
+        .bind(&source_url)
+        .bind(&host)
+        .execute(&mut *transaction)
+        .await
+        .expect("source should insert");
+
+        let message_id =
+            sqlx::query_scalar::<_, i64>("select public.enqueue_source_refresh($1, 'seed', 0, 0)")
+                .bind(source_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("seed trigger should enqueue");
+
+        assert!(message_id > 0);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
 }
