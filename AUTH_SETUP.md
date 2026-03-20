@@ -13,7 +13,7 @@ Copy `.env.example` to `.env` and set:
 - `DATABASE_URL`: use the Supabase session pooler on port `5432`
 - `SUPABASE_URL`: your project URL, for example `https://<project-ref>.supabase.co`
 - `SUPABASE_PUBLISHABLE_KEY`: required for `POST /auth/signup` and `POST /auth/session`
-- `SUPABASE_SERVICE_ROLE_KEY`: required for atomic signup onboarding with topics and source subscriptions
+- `SUPABASE_SERVICE_ROLE_KEY`: optional, only needed if you want `POST /auth/signup` itself to also write onboarding topics and source subscriptions atomically
 - `SUPABASE_JWT_AUDIENCE`: leave as `authenticated` unless you changed your JWT audience
 - `DB_MAX_CONNECTIONS`: defaults to `10`
 
@@ -57,12 +57,16 @@ Copy `.env.example` to `.env` and set:
 
 1. Sign up with `email + password` in the browser with Supabase Auth.
 2. Optionally call `POST /recommendations/sources/preview` with onboarding topic selections before the user exists.
-3. If you are testing from the backend first, call `POST /auth/signup` with optional onboarding `topic_slugs`, `language_codes`, and `source_ids`.
+3. Call `POST /auth/signup` with only `username`, `email`, and `password`.
 4. Create a session with `POST /auth/session`.
 5. Refresh sessions with `POST /auth/session/refresh` when you need a fresh access token.
-6. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
-7. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
-8. Send `Authorization: Bearer <access_token>` on protected API calls.
+6. Call `PUT /me/recommendation-preferences` with the selected `topic_slugs` and `language_codes`.
+7. Call `POST /me/source-subscriptions` for each source selected during onboarding.
+8. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
+9. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
+10. Send `Authorization: Bearer <access_token>` on protected API calls.
+
+If you do choose to set `SUPABASE_SERVICE_ROLE_KEY`, the backend can also accept onboarding `topic_slugs`, `language_codes`, and `source_ids` directly on `POST /auth/signup` and roll back the auth user if the onboarding write fails. That path is optional.
 
 ## Content processing setup
 

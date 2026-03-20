@@ -18,6 +18,18 @@ For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SET
 - Compact readable text is returned in `body.blocks`.
 - Favicons are fetched separately from `/me/content/{content_id}/favicon`.
 
+## Recommended Onboarding Flow
+
+Use this flow if you do not want the Supabase `service_role` key in the backend:
+
+1. Call `POST /recommendations/sources/preview` with the user's selected `topic_slugs`.
+2. Call `POST /auth/signup` with only `username`, `email`, and `password`.
+3. Call `POST /auth/session`.
+4. Call `PUT /me/recommendation-preferences`.
+5. Call `POST /me/source-subscriptions` for each selected source.
+
+The backend also supports sending onboarding fields directly to `POST /auth/signup`, but that path requires `SUPABASE_SERVICE_ROLE_KEY` so the backend can delete a partially-created auth user if onboarding fails.
+
 ## Endpoint Index
 
 ### Public
@@ -79,7 +91,20 @@ PASSWORD='your-password'
 
 ## Common Flow
 
-### 1. Optional: create a user
+### 1. Preview onboarding sources
+
+```bash
+curl -sS -X POST "$API/recommendations/sources/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "topic_slugs": ["technology", "science"],
+    "language_codes": ["en"],
+    "limit": 10
+  }' \
+  | jq
+```
+
+### 2. Create a user
 
 ```bash
 curl -sS -X POST "$API/auth/signup" \
@@ -87,15 +112,12 @@ curl -sS -X POST "$API/auth/signup" \
   -d '{
     "username": "reader01",
     "email": "'"$EMAIL"'",
-    "password": "'"$PASSWORD"'",
-    "topic_slugs": ["technology", "science"],
-    "language_codes": ["en"],
-    "source_ids": ["source-id-from-preview"]
+    "password": "'"$PASSWORD"'"
   }' \
   | jq
 ```
 
-### 2. Create a session
+### 3. Create a session
 
 ```bash
 TOKEN=$(
@@ -109,7 +131,7 @@ TOKEN=$(
 )
 ```
 
-### 2b. Refresh a session
+### 3b. Refresh a session
 
 ```bash
 curl -sS -X POST "$API/auth/session/refresh" \
@@ -120,7 +142,32 @@ curl -sS -X POST "$API/auth/session/refresh" \
   | jq
 ```
 
-### 3. Fetch the library
+### 4. Save onboarding preferences
+
+```bash
+curl -sS -X PUT "$API/me/recommendation-preferences" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "topic_slugs": ["technology", "science"],
+    "language_codes": ["en"]
+  }' \
+  | jq
+```
+
+### 5. Subscribe to selected sources
+
+```bash
+curl -sS -X POST "$API/me/source-subscriptions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_url": "https://example.com/"
+  }' \
+  | jq
+```
+
+### 6. Fetch the library
 
 ```bash
 curl -sS "$API/me/saved-content?limit=20" \
@@ -128,7 +175,7 @@ curl -sS "$API/me/saved-content?limit=20" \
   | jq
 ```
 
-### 4. Save a new URL
+### 7. Save a new URL
 
 ```bash
 curl -sS -X POST "$API/me/saved-content" \
@@ -141,7 +188,7 @@ curl -sS -X POST "$API/me/saved-content" \
   | jq
 ```
 
-### 5. Read one item
+### 8. Read one item
 
 ```bash
 SAVED_CONTENT_ID='saved-content-id'
@@ -156,7 +203,7 @@ Readable content is in:
 - `.content.body.kind`
 - `.content.body.blocks`
 
-### 6. Fetch recommendations
+### 9. Fetch recommendations
 
 ```bash
 curl -sS "$API/me/recommendations/content?limit=10" \
@@ -164,7 +211,7 @@ curl -sS "$API/me/recommendations/content?limit=10" \
   | jq
 ```
 
-### 7. Report reading telemetry
+### 10. Report reading telemetry
 
 ```bash
 SERVE_ID='recommendation-serve-id'
@@ -237,6 +284,8 @@ Request body:
 }
 ```
 
+If you also send onboarding fields like `topic_slugs`, `language_codes`, or `source_ids`, the backend will only accept that when `SUPABASE_SERVICE_ROLE_KEY` is configured.
+
 #### `POST /auth/session`
 
 Create an email/password session.
@@ -247,6 +296,18 @@ Request body:
 {
   "email": "user@example.com",
   "password": "your-password"
+}
+```
+
+#### `POST /auth/session/refresh`
+
+Exchange a refresh token for a new session.
+
+Request body:
+
+```json
+{
+  "refresh_token": "supabase-refresh-token"
 }
 ```
 
