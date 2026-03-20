@@ -14,9 +14,11 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::{
     Router,
+    http::{Method, header::ACCEPT, header::AUTHORIZATION, header::CONTENT_TYPE},
     routing::{get, post, put},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
@@ -42,6 +44,7 @@ async fn main() {
         .init();
 
     let config = Config::from_env().unwrap_or_else(|error| panic!("{error}"));
+    let cors = build_cors_layer(&config);
 
     let pool = PgPoolOptions::new()
         .max_connections(config.db_max_connections)
@@ -119,6 +122,7 @@ async fn main() {
                 .patch(source_subscriptions::update_inbox_item),
         )
         .route("/profiles/{username}", get(profile::public_profile))
+        .layer(cors)
         .with_state(AppState {
             auth: SupabaseAuth::new(config.supabase.clone()),
             auth_api: SupabaseAuthApi::new(&config.supabase),
@@ -138,4 +142,28 @@ async fn main() {
     )
     .await
     .expect("server exited unexpectedly");
+}
+
+fn build_cors_layer(config: &Config) -> CorsLayer {
+    let allowed_origins = config
+        .cors_allowed_origins
+        .iter()
+        .map(|origin| {
+            origin
+                .parse()
+                .unwrap_or_else(|_| panic!("CORS_ALLOWED_ORIGINS contains an invalid origin"))
+        })
+        .collect::<Vec<_>>();
+
+    CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
 }

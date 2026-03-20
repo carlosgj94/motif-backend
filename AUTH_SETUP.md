@@ -14,6 +14,7 @@ Copy `.env.example` to `.env` and set:
 - `SUPABASE_URL`: your project URL, for example `https://<project-ref>.supabase.co`
 - `SUPABASE_PUBLISHABLE_KEY`: required for `POST /auth/signup` and `POST /auth/session`
 - `SUPABASE_SERVICE_ROLE_KEY`: optional, only needed if you want `POST /auth/signup` itself to also write onboarding topics and source subscriptions atomically
+- `CORS_ALLOWED_ORIGINS`: optional comma-separated browser origins allowed to call the API; defaults include `localhost`, `127.0.0.1`, and `0.0.0.0` on ports `3000` and `3001`
 - `SUPABASE_JWT_AUDIENCE`: leave as `authenticated` unless you changed your JWT audience
 - `DB_MAX_CONNECTIONS`: defaults to `10`
 

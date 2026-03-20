@@ -1,8 +1,11 @@
 use std::{env, net::SocketAddr, time::Duration};
 
+use axum::http::HeaderValue;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: SocketAddr,
+    pub cors_allowed_origins: Vec<String>,
     pub database_url: String,
     pub db_max_connections: u32,
     pub supabase: SupabaseConfig,
@@ -27,6 +30,8 @@ impl Config {
             .unwrap_or_else(|_| "0.0.0.0:3000".to_string())
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::invalid("APP_BIND_ADDR", "must be a valid socket address"))?;
+        let cors_allowed_origins =
+            parse_cors_allowed_origins(env::var("CORS_ALLOWED_ORIGINS").ok().as_deref())?;
 
         let database_url =
             env::var("DATABASE_URL").map_err(|_| ConfigError::missing("DATABASE_URL"))?;
@@ -76,6 +81,7 @@ impl Config {
 
         Ok(Self {
             bind_addr,
+            cors_allowed_origins,
             database_url,
             db_max_connections,
             supabase: SupabaseConfig {
@@ -89,6 +95,47 @@ impl Config {
             },
         })
     }
+}
+
+fn parse_cors_allowed_origins(value: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let origins = match value {
+        Some(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+        None => default_cors_allowed_origins(),
+    };
+
+    if origins.is_empty() {
+        return Err(ConfigError::invalid(
+            "CORS_ALLOWED_ORIGINS",
+            "must include at least one origin",
+        ));
+    }
+
+    for origin in &origins {
+        HeaderValue::from_str(origin).map_err(|_| {
+            ConfigError::invalid("CORS_ALLOWED_ORIGINS", "contains an invalid origin")
+        })?;
+    }
+
+    Ok(origins)
+}
+
+fn default_cors_allowed_origins() -> Vec<String> {
+    [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://0.0.0.0:3000",
+        "http://0.0.0.0:3001",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -117,3 +164,32 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_cors_allowed_origins, parse_cors_allowed_origins};
+
+    #[test]
+    fn defaults_cors_allowed_origins_to_local_dev_hosts() {
+        let origins = default_cors_allowed_origins();
+        assert!(origins.contains(&"http://localhost:3000".to_string()));
+        assert!(origins.contains(&"http://localhost:3001".to_string()));
+        assert!(origins.contains(&"http://0.0.0.0:3000".to_string()));
+        assert!(origins.contains(&"http://0.0.0.0:3001".to_string()));
+    }
+
+    #[test]
+    fn parses_custom_cors_allowed_origins() {
+        let origins =
+            parse_cors_allowed_origins(Some("https://app.example.com, http://localhost:3000"))
+                .expect("origins should parse");
+
+        assert_eq!(
+            origins,
+            vec![
+                "https://app.example.com".to_string(),
+                "http://localhost:3000".to_string()
+            ]
+        );
+    }
+}

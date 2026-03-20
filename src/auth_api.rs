@@ -502,8 +502,8 @@ impl SupabaseAuthError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RefreshSessionRequest, SignUpRequest, SupabaseAuthApi, build_auth_headers,
-        normalize_email, normalize_password,
+        RefreshSessionRequest, SignUpRequest, SupabaseAuthApi, build_auth_headers, normalize_email,
+        normalize_password,
     };
     use crate::{
         AppState, auth::SupabaseAuth, config::SupabaseConfig, rate_limit::AuthRateLimiter,
