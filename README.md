@@ -4,6 +4,12 @@ Rust API for authentication, saved content, subscriptions, inbox delivery, and r
 
 For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SETUP.md).
 
+## Toolchain
+
+- Rust `1.88+` is required.
+- This repo pins `rust-toolchain.toml` to `1.88.0`.
+- If your environment defaults to `rustc 1.85.1`, update the toolchain before building.
+
 ## Basics
 
 - `POST /auth/session` creates an email/password session.
