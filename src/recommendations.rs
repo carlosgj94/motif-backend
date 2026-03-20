@@ -32,6 +32,32 @@ const MAX_LANGUAGE_PREFERENCES: usize = 8;
 const IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT: i32 = 10_000;
 const RECOMMENDATION_ALGORITHM_VERSION: &str = "v1-postgres-hybrid";
 
+pub async fn list_recommendation_topics(
+    State(state): State<AppState>,
+) -> ApiResult<Json<RecommendationTopicListResponse>> {
+    let rows = sqlx::query_as::<_, RecommendationTopicRow>(
+        r#"
+        select
+            id,
+            slug,
+            label,
+            description
+        from public.topics
+        order by label asc, slug asc
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(map_recommendation_error)?;
+
+    let topics = rows
+        .into_iter()
+        .map(build_recommendation_topic)
+        .collect::<Vec<_>>();
+
+    Ok(Json(RecommendationTopicListResponse { topics }))
+}
+
 pub async fn list_content_recommendations(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -892,6 +918,15 @@ fn build_content_recommendation_item(
     })
 }
 
+fn build_recommendation_topic(row: RecommendationTopicRow) -> RecommendationTopic {
+    RecommendationTopic {
+        id: row.id,
+        slug: row.slug,
+        label: row.label,
+        description: row.description,
+    }
+}
+
 fn build_source_recommendation_item(
     position: usize,
     candidate: ScoredSourceCandidate,
@@ -1343,6 +1378,11 @@ pub struct RecommendationPreferencesResponse {
     language_codes: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecommendationTopicListResponse {
+    topics: Vec<RecommendationTopic>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PublicSourceRecommendationsRequest {
     #[serde(default)]
@@ -1416,6 +1456,15 @@ pub struct SourceRecommendationItem {
 pub struct PublicSourceRecommendationItem {
     position: u32,
     source: RecommendationSourceSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecommendationTopic {
+    id: Uuid,
+    slug: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1747,12 +1796,21 @@ struct RecommendationPreferencesRow {
     language_codes: Vec<String>,
 }
 
+#[derive(Debug, FromRow)]
+struct RecommendationTopicRow {
+    id: Uuid,
+    slug: String,
+    label: String,
+    description: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PublicInteractionEventType, PublicSourceRecommendationsRequest, freshness_score,
-        normalize_language_codes, normalize_positive_score, normalize_topic_slugs,
-        preview_source_recommendations, validate_public_interaction_event,
+        PublicInteractionEventType, PublicSourceRecommendationsRequest, RecommendationTopicRow,
+        build_recommendation_topic, freshness_score, normalize_language_codes,
+        normalize_positive_score, normalize_topic_slugs, preview_source_recommendations,
+        validate_public_interaction_event,
     };
     use crate::{
         AppState, auth::SupabaseAuth, auth_api::SupabaseAuthApi, config::SupabaseConfig,
@@ -1858,5 +1916,20 @@ mod tests {
 
         let response = result.expect_err("preview should fail").into_response();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn builds_recommendation_topic_with_description() {
+        let topic = build_recommendation_topic(RecommendationTopicRow {
+            id: Uuid::nil(),
+            slug: "technology".to_string(),
+            label: "Technology".to_string(),
+            description: Some("Software and engineering".to_string()),
+        });
+
+        let value = serde_json::to_value(topic).expect("topic should serialize");
+        assert_eq!(value["slug"], "technology");
+        assert_eq!(value["label"], "Technology");
+        assert_eq!(value["description"], "Software and engineering");
     }
 }

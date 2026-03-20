@@ -65,6 +65,10 @@ async fn main() {
         .route("/auth/session", post(auth_api::create_session))
         .route("/auth/session/refresh", post(auth_api::refresh_session))
         .route(
+            "/recommendations/topics",
+            get(recommendations::list_recommendation_topics),
+        )
+        .route(
             "/recommendations/sources/preview",
             post(recommendations::preview_source_recommendations),
         )
