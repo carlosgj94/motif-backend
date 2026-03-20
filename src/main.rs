@@ -95,7 +95,8 @@ async fn main() {
         )
         .route(
             "/me/recommendation-preferences",
-            put(recommendations::update_recommendation_preferences),
+            get(recommendations::get_recommendation_preferences)
+                .put(recommendations::update_recommendation_preferences),
         )
         .route(
             "/me/source-subscriptions",

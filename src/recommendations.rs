@@ -319,10 +319,18 @@ pub async fn update_recommendation_preferences(
         .await
         .map_err(map_recommendation_error)?;
 
-    Ok(Json(RecommendationPreferencesResponse {
-        topic_slugs,
-        language_codes,
-    }))
+    let preferences = load_recommendation_preferences(&state.pool, user.user_id).await?;
+
+    Ok(Json(preferences))
+}
+
+pub async fn get_recommendation_preferences(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<RecommendationPreferencesResponse>> {
+    let preferences = load_recommendation_preferences(&state.pool, user.user_id).await?;
+
+    Ok(Json(preferences))
 }
 
 pub(crate) async fn record_internal_content_event(
@@ -461,6 +469,40 @@ async fn load_user_recommendation_context(
             .subscribed_source_ids
             .into_iter()
             .collect::<HashSet<_>>(),
+    })
+}
+
+async fn load_recommendation_preferences(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> ApiResult<RecommendationPreferencesResponse> {
+    let row = sqlx::query_as::<_, RecommendationPreferencesRow>(
+        r#"
+        select
+            coalesce(urs.preferred_languages, '{}'::text[]) as language_codes,
+            coalesce(
+                (
+                    select array_agg(t.slug order by t.slug)
+                    from public.user_topic_preferences utp
+                    join public.topics t
+                      on t.id = utp.topic_id
+                    where utp.user_id = $1
+                ),
+                '{}'::text[]
+            ) as topic_slugs
+        from (select $1::uuid as user_id) as input
+        left join public.user_recommendation_settings urs
+          on urs.user_id = input.user_id
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(map_recommendation_error)?;
+
+    Ok(RecommendationPreferencesResponse {
+        topic_slugs: row.topic_slugs,
+        language_codes: row.language_codes,
     })
 }
 
@@ -1476,6 +1518,12 @@ struct RecommendationContentDetailRow {
 #[derive(Debug, FromRow)]
 struct TopicRow {
     id: Uuid,
+}
+
+#[derive(Debug, FromRow)]
+struct RecommendationPreferencesRow {
+    topic_slugs: Vec<String>,
+    language_codes: Vec<String>,
 }
 
 #[cfg(test)]

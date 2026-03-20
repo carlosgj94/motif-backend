@@ -63,6 +63,7 @@ For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SET
 
 - `GET /me/recommendations/content`
 - `GET /me/recommendations/sources`
+- `GET /me/recommendation-preferences`
 - `PUT /me/recommendation-preferences`
 - `POST /me/interaction-events/batch`
 
@@ -552,6 +553,16 @@ Request body:
   "topic_slugs": ["technology", "science"],
   "language_codes": ["en"]
 }
+```
+
+#### `GET /me/recommendation-preferences`
+
+Read the authenticated user's current recommendation preferences.
+
+```bash
+curl -sS "$API/me/recommendation-preferences" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
 ```
 
 #### `POST /me/interaction-events/batch`
