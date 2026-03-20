@@ -14,11 +14,6 @@ use crate::{
     config::SupabaseConfig,
     error::{ApiError, ApiResult},
     profile::normalize_username,
-    recommendations::{
-        apply_recommendation_preferences, rollup_and_refresh_recommendation_state,
-        validate_recommendation_preferences,
-    },
-    source_subscriptions::{subscribe_user_to_sources, validate_existing_source_ids},
 };
 
 #[derive(Clone)]
@@ -26,7 +21,6 @@ pub struct SupabaseAuthApi {
     api_key: Option<String>,
     api_url: String,
     client: Client,
-    service_role_key: Option<String>,
 }
 
 impl SupabaseAuthApi {
@@ -45,7 +39,6 @@ impl SupabaseAuthApi {
             api_key: config.publishable_key.clone(),
             api_url: format!("{}/auth/v1", config.url),
             client,
-            service_role_key: config.service_role_key.clone(),
         }
     }
 
@@ -99,48 +92,6 @@ impl SupabaseAuthApi {
             }),
         )
         .await
-    }
-
-    pub fn supports_atomic_onboarding(&self) -> bool {
-        self.service_role_key.is_some()
-    }
-
-    pub async fn delete_user(&self, user_id: Uuid) -> Result<(), ApiError> {
-        let service_role_key = self.service_role_key.as_deref().ok_or_else(|| {
-            ApiError::internal("SUPABASE_SERVICE_ROLE_KEY must be set to delete auth users")
-        })?;
-        let headers = build_auth_headers(service_role_key)?;
-        let response = self
-            .client
-            .delete(format!("{}/admin/users/{}", self.api_url, user_id))
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, %user_id, "failed to call Supabase admin delete user API");
-                ApiError::internal("Failed to reach Supabase auth API")
-            })?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let body = response.bytes().await.map_err(|error| {
-            tracing::error!(error = %error, %user_id, "failed to read Supabase auth delete user response body");
-            ApiError::internal("Failed to read Supabase auth response")
-        })?;
-        let provider_error = serde_json::from_slice::<SupabaseAuthError>(&body).ok();
-        let message = provider_error
-            .as_ref()
-            .and_then(SupabaseAuthError::message)
-            .unwrap_or("Supabase auth delete user request failed");
-
-        Err(ApiError::with_status(
-            map_upstream_status(status),
-            "auth_provider_error",
-            message,
-        ))
     }
 
     async fn send_auth_request(
@@ -200,66 +151,13 @@ pub async fn sign_up(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<SignUpRequest>,
 ) -> ApiResult<Json<AuthFlowResponse>> {
-    let validated_preferences = validate_recommendation_preferences(
-        &state.pool,
-        &payload.topic_slugs,
-        &payload.language_codes,
-    )
-    .await?;
-    let validated_source_ids =
-        validate_existing_source_ids(&state.pool, &payload.source_ids).await?;
-    let has_onboarding = !validated_preferences.is_empty() || !validated_source_ids.is_empty();
-    if has_onboarding && !state.auth_api.supports_atomic_onboarding() {
-        return Err(ApiError::internal(
-            "SUPABASE_SERVICE_ROLE_KEY must be set to use onboarding fields during signup",
-        ));
-    }
-
     enforce_auth_rate_limit(
         &state,
         remote_addr,
         AuthRouteKind::SignUp,
         normalize_email(&payload.email)?,
     )?;
-    let response = state.auth_api.sign_up(payload).await?;
-    if !has_onboarding {
-        return Ok(Json(response));
-    }
-
-    let user_id = response
-        .user
-        .as_ref()
-        .map(|user| user.id)
-        .ok_or_else(|| ApiError::internal("Supabase signup response did not include a user"))?;
-
-    let onboarding_result = async {
-        let mut transaction = state.pool.begin().await.map_err(map_signup_error)?;
-        apply_recommendation_preferences(&mut transaction, user_id, &validated_preferences).await?;
-        subscribe_user_to_sources(
-            &mut transaction,
-            user_id,
-            &validated_source_ids,
-            "auth_signup",
-        )
-        .await?;
-        rollup_and_refresh_recommendation_state(&mut transaction, user_id).await?;
-        transaction.commit().await.map_err(map_signup_error)?;
-        Ok::<(), ApiError>(())
-    }
-    .await;
-
-    if let Err(error) = onboarding_result {
-        if let Err(cleanup_error) = state.auth_api.delete_user(user_id).await {
-            tracing::error!(
-                error = ?cleanup_error,
-                %user_id,
-                "failed to roll back auth user after signup onboarding error",
-            );
-        }
-        return Err(error);
-    }
-
-    Ok(Json(response))
+    state.auth_api.sign_up(payload).await.map(Json)
 }
 
 pub async fn create_session(
@@ -369,22 +267,11 @@ fn enforce_auth_refresh_rate_limit(
         .check_session_refresh(remote_addr.ip(), refresh_token)
 }
 
-fn map_signup_error(error: sqlx::Error) -> ApiError {
-    tracing::error!(error = %error, "signup onboarding transaction failed");
-    ApiError::internal("Database operation failed")
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignUpRequest {
     pub username: String,
     pub email: String,
     pub password: String,
-    #[serde(default)]
-    pub topic_slugs: Vec<String>,
-    #[serde(default)]
-    pub language_codes: Vec<String>,
-    #[serde(default)]
-    pub source_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,6 +422,13 @@ mod tests {
         body: Value,
     }
 
+    #[derive(Debug)]
+    struct CapturedSignUpRequest {
+        auth_header: String,
+        api_key_header: String,
+        body: Value,
+    }
+
     #[derive(Clone)]
     struct CaptureState {
         sender: Arc<Mutex<Option<oneshot::Sender<CapturedRefreshRequest>>>>,
@@ -545,11 +439,7 @@ mod tests {
         refresh_token: String,
     }
 
-    fn test_supabase_config(
-        url: String,
-        publishable_key: &str,
-        service_role_key: Option<&str>,
-    ) -> SupabaseConfig {
+    fn test_supabase_config(url: String, publishable_key: &str) -> SupabaseConfig {
         SupabaseConfig {
             url: url.clone(),
             issuer: format!("{url}/auth/v1"),
@@ -557,16 +447,12 @@ mod tests {
             audience: "authenticated".to_string(),
             jwks_cache_ttl: Duration::from_secs(300),
             publishable_key: Some(publishable_key.to_string()),
-            service_role_key: service_role_key.map(ToOwned::to_owned),
         }
     }
 
-    fn test_app_state(service_role_key: Option<&str>) -> AppState {
-        let config = test_supabase_config(
-            "http://127.0.0.1:9999".to_string(),
-            "publishable-test-key",
-            service_role_key,
-        );
+    fn test_app_state() -> AppState {
+        let config =
+            test_supabase_config("http://127.0.0.1:9999".to_string(), "publishable-test-key");
 
         AppState {
             auth: SupabaseAuth::new(config.clone()),
@@ -625,6 +511,52 @@ mod tests {
         }))
     }
 
+    async fn capture_sign_up_request(
+        State(state): State<CaptureState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        let captured = CapturedSignUpRequest {
+            auth_header: headers[AUTHORIZATION]
+                .to_str()
+                .expect("authorization header should be valid")
+                .to_string(),
+            api_key_header: headers["apikey"]
+                .to_str()
+                .expect("apikey header should be valid")
+                .to_string(),
+            body,
+        };
+
+        if let Some(sender) = state
+            .sender
+            .lock()
+            .expect("mutex should not be poisoned")
+            .take()
+        {
+            let captured = CapturedRefreshRequest {
+                query: HashMap::new(),
+                auth_header: captured.auth_header,
+                api_key_header: captured.api_key_header,
+                body: captured.body,
+            };
+            let _ = sender.send(captured);
+        }
+
+        Json(json!({
+            "user": {
+                "id": Uuid::nil(),
+                "email": "user@example.com",
+                "role": "authenticated",
+                "email_confirmed_at": null,
+                "user_metadata": {
+                    "username": "reader01"
+                },
+                "app_metadata": {}
+            }
+        }))
+    }
+
     #[test]
     fn normalizes_email_to_lowercase() {
         assert_eq!(
@@ -670,11 +602,7 @@ mod tests {
             axum::serve(listener, app).await.expect("server should run");
         });
 
-        let config = test_supabase_config(
-            format!("http://{address}"),
-            "publishable-test-key",
-            Some("service-role-key"),
-        );
+        let config = test_supabase_config(format!("http://{address}"), "publishable-test-key");
         let auth_api = SupabaseAuthApi::new(&config);
         let response = auth_api
             .refresh_session(RefreshSessionRequest {
@@ -706,32 +634,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_up_rejects_onboarding_without_service_role_key() {
-        let state = test_app_state(None);
-        let result = super::sign_up(
-            State(state),
-            ConnectInfo("127.0.0.1:4000".parse::<SocketAddr>().unwrap()),
-            Json(SignUpRequest {
+    async fn sign_up_uses_only_auth_fields() {
+        let (sender, receiver) = oneshot::channel();
+        let capture_state = CaptureState {
+            sender: Arc::new(Mutex::new(Some(sender))),
+        };
+        let app = Router::new()
+            .route("/auth/v1/signup", post(capture_sign_up_request))
+            .with_state(capture_state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let config = test_supabase_config(format!("http://{address}"), "publishable-test-key");
+        let auth_api = SupabaseAuthApi::new(&config);
+        let response = auth_api
+            .sign_up(SignUpRequest {
                 username: "reader01".to_string(),
                 email: "user@example.com".to_string(),
                 password: "password123".to_string(),
-                topic_slugs: Vec::new(),
-                language_codes: vec!["en".to_string()],
-                source_ids: Vec::new(),
-            }),
-        )
-        .await;
+            })
+            .await
+            .expect("sign up should succeed");
 
-        let response = result.expect_err("signup should fail").into_response();
+        let captured = receiver.await.expect("request should be captured");
+        server.abort();
+
+        assert_eq!(captured.auth_header, "Bearer publishable-test-key");
+        assert_eq!(captured.api_key_header, "publishable-test-key");
         assert_eq!(
-            response.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            captured.body,
+            json!({
+                "email": "user@example.com",
+                "password": "password123",
+                "data": {
+                    "username": "reader01"
+                }
+            })
         );
+        assert_eq!(
+            response.user.expect("user should be present").email,
+            Some("user@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn sign_up_request_ignores_extra_onboarding_fields() {
+        let request = serde_json::from_value::<SignUpRequest>(json!({
+            "username": "reader01",
+            "email": "user@example.com",
+            "password": "password123",
+            "topic_slugs": ["technology"],
+            "language_codes": ["en"],
+            "source_ids": [Uuid::nil()],
+        }))
+        .expect("signup request should deserialize");
+
+        assert_eq!(request.username, "reader01");
+        assert_eq!(request.email, "user@example.com");
+        assert_eq!(request.password, "password123");
     }
 
     #[tokio::test]
     async fn refresh_session_handler_rejects_empty_refresh_token() {
-        let state = test_app_state(Some("service-role-key"));
+        let state = test_app_state();
         let result = super::refresh_session(
             State(state),
             ConnectInfo("127.0.0.1:4000".parse::<SocketAddr>().unwrap()),

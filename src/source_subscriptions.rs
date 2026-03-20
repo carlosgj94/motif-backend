@@ -1,4 +1,4 @@
-use std::{collections::HashSet, str::FromStr};
+use std::str::FromStr;
 
 use axum::{
     Json,
@@ -30,8 +30,6 @@ use crate::{
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 100;
-const MAX_ONBOARDING_SOURCE_SELECTIONS: usize = 24;
-
 pub async fn create_source_subscription(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -646,61 +644,6 @@ async fn invoke_source_processor(
     Ok(())
 }
 
-pub(crate) async fn validate_existing_source_ids(
-    pool: &PgPool,
-    source_ids: &[Uuid],
-) -> ApiResult<Vec<Uuid>> {
-    let normalized_ids = normalize_source_ids(source_ids)?;
-    if normalized_ids.is_empty() {
-        return Ok(normalized_ids);
-    }
-
-    let rows =
-        sqlx::query_scalar::<_, Uuid>("select id from public.content_sources where id = any($1)")
-            .bind(&normalized_ids)
-            .fetch_all(pool)
-            .await
-            .map_err(map_source_error)?;
-
-    if rows.len() != normalized_ids.len() {
-        return Err(ApiError::bad_request("At least one source_id is invalid"));
-    }
-
-    Ok(normalized_ids)
-}
-
-pub(crate) async fn subscribe_user_to_sources(
-    transaction: &mut Transaction<'_, Postgres>,
-    user_id: Uuid,
-    source_ids: &[Uuid],
-    surface: &'static str,
-) -> ApiResult<Vec<Uuid>> {
-    let normalized_ids = normalize_source_ids(source_ids)?;
-    let mut created_source_ids = Vec::new();
-
-    for source_id in normalized_ids {
-        let existing_id =
-            find_existing_source_subscription_id(transaction, user_id, source_id).await?;
-        upsert_source_subscription(transaction, user_id, source_id).await?;
-        enqueue_source_refresh(transaction, source_id, "signup", 0).await?;
-        invoke_source_processor(transaction, source_id, "signup").await?;
-
-        if existing_id.is_none() {
-            record_internal_source_event(
-                transaction,
-                user_id,
-                source_id,
-                InternalEventType::Subscribe,
-                surface,
-            )
-            .await?;
-            created_source_ids.push(source_id);
-        }
-    }
-
-    Ok(created_source_ids)
-}
-
 async fn fetch_source_subscription_summary(
     pool: &PgPool,
     user_id: Uuid,
@@ -959,22 +902,6 @@ fn decode_inbox_cursor(cursor: &str) -> ApiResult<InboxCursorDecoded> {
 fn map_source_error(error: sqlx::Error) -> ApiError {
     tracing::error!(error = %error, "source subscription query failed");
     ApiError::internal("Database operation failed")
-}
-
-fn normalize_source_ids(source_ids: &[Uuid]) -> ApiResult<Vec<Uuid>> {
-    if source_ids.len() > MAX_ONBOARDING_SOURCE_SELECTIONS {
-        return Err(ApiError::bad_request("Too many source_ids were provided"));
-    }
-
-    let mut normalized = Vec::new();
-    let mut seen = HashSet::new();
-    for source_id in source_ids {
-        if seen.insert(*source_id) {
-            normalized.push(*source_id);
-        }
-    }
-
-    Ok(normalized)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

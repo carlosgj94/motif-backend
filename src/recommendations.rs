@@ -581,14 +581,6 @@ pub(crate) async fn apply_recommendation_preferences(
     Ok(())
 }
 
-pub(crate) async fn rollup_and_refresh_recommendation_state(
-    transaction: &mut Transaction<'_, Postgres>,
-    user_id: Uuid,
-) -> ApiResult<()> {
-    rollup_interaction_events(transaction, IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT).await?;
-    refresh_recommendation_targets(transaction, Some(user_id), None, None).await
-}
-
 async fn load_recommendation_preferences(
     pool: &PgPool,
     user_id: Uuid,
@@ -1784,12 +1776,6 @@ pub(crate) struct ValidatedRecommendationPreferences {
     pub(crate) topic_ids: Vec<Uuid>,
 }
 
-impl ValidatedRecommendationPreferences {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.topic_ids.is_empty() && self.language_codes.is_empty()
-    }
-}
-
 #[derive(Debug, FromRow)]
 struct RecommendationPreferencesRow {
     topic_slugs: Vec<String>,
@@ -1831,7 +1817,6 @@ mod tests {
             audience: "authenticated".to_string(),
             jwks_cache_ttl: Duration::from_secs(300),
             publishable_key: Some("publishable-test-key".to_string()),
-            service_role_key: Some("service-role-key".to_string()),
         };
 
         AppState {

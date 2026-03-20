@@ -29,8 +29,6 @@ Use this flow if you do not want the Supabase `service_role` key in the backend:
 5. Call `PUT /me/recommendation-preferences`.
 6. Call `POST /me/source-subscriptions` for each selected source.
 
-The backend also supports sending onboarding fields directly to `POST /auth/signup`, but that path requires `SUPABASE_SERVICE_ROLE_KEY` so the backend can delete a partially-created auth user if onboarding fails.
-
 ## Endpoint Index
 
 ### Public
@@ -292,7 +290,12 @@ Request body:
 }
 ```
 
-If you also send onboarding fields like `topic_slugs`, `language_codes`, or `source_ids`, the backend will only accept that when `SUPABASE_SERVICE_ROLE_KEY` is configured.
+Signup is auth-only. Apply onboarding preferences and source subscriptions after `POST /auth/session` with:
+
+- `PUT /me/recommendation-preferences`
+- `POST /me/source-subscriptions`
+
+Older clients can still send extra onboarding keys in the signup payload; they are ignored.
 
 #### `POST /auth/session`
 

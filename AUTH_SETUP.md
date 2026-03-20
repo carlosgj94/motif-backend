@@ -13,7 +13,6 @@ Copy `.env.example` to `.env` and set:
 - `DATABASE_URL`: use the Supabase session pooler on port `5432`
 - `SUPABASE_URL`: your project URL, for example `https://<project-ref>.supabase.co`
 - `SUPABASE_PUBLISHABLE_KEY`: required for `POST /auth/signup` and `POST /auth/session`
-- `SUPABASE_SERVICE_ROLE_KEY`: optional, only needed if you want `POST /auth/signup` itself to also write onboarding topics and source subscriptions atomically
 - `CORS_ALLOWED_ORIGINS`: optional comma-separated browser origins allowed to call the API; defaults include `localhost`, `127.0.0.1`, and `0.0.0.0` on ports `3000` and `3001`
 - `SUPABASE_JWT_AUDIENCE`: leave as `authenticated` unless you changed your JWT audience
 - `DB_MAX_CONNECTIONS`: defaults to `10`
@@ -68,8 +67,6 @@ Copy `.env.example` to `.env` and set:
 9. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
 10. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
 11. Send `Authorization: Bearer <access_token>` on protected API calls.
-
-If you do choose to set `SUPABASE_SERVICE_ROLE_KEY`, the backend can also accept onboarding `topic_slugs`, `language_codes`, and `source_ids` directly on `POST /auth/signup` and roll back the auth user if the onboarding write fails. That path is optional.
 
 ## Content processing setup
 
