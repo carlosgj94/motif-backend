@@ -48,8 +48,8 @@ Copy `.env.example` to `.env` and set:
 - `POST /auth/signup`: create an email/password auth user and store `username` in Supabase user metadata
 - `POST /auth/session`: sign in with email/password and receive a Supabase session payload
 - `POST /auth/session/refresh`: exchange a refresh token for a fresh session payload
-- `GET /recommendations/topics`: list onboarding topics before the user exists
-- `POST /recommendations/sources/preview`: get pre-auth source recommendations for onboarding topic selections
+- `GET /recommendations/topics`: list onboarding topics before the user exists, including nested subtopics
+- `POST /recommendations/sources/preview`: get pre-auth source recommendations for onboarding topic or subtopic selections
 - `GET /me`: returns the verified Supabase user plus any claimed app profile
 - `PUT /me/profile`: create or update the authenticated user's app profile
 - `GET /profiles/:username`: fetch a public profile by username
@@ -57,8 +57,8 @@ Copy `.env.example` to `.env` and set:
 ## Expected client flow
 
 1. Sign up with `email + password` in the browser with Supabase Auth.
-2. Call `GET /recommendations/topics` to populate the onboarding topic picker.
-3. Optionally call `POST /recommendations/sources/preview` with onboarding topic selections before the user exists.
+2. Call `GET /recommendations/topics` to populate the onboarding topic picker and any nested subtopic choices.
+3. Optionally call `POST /recommendations/sources/preview` with onboarding topic or subtopic selections before the user exists.
 4. Call `POST /auth/signup` with only `username`, `email`, and `password`.
 5. Create a session with `POST /auth/session`.
 6. Refresh sessions with `POST /auth/session/refresh` when you need a fresh access token.
@@ -67,6 +67,19 @@ Copy `.env.example` to `.env` and set:
 9. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
 10. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
 11. Send `Authorization: Bearer <access_token>` on protected API calls.
+
+## Recommendation taxonomy
+
+- `GET /recommendations/topics` now returns a nested topic tree.
+- Both parent topics and subtopics are valid `topic_slugs` inputs for onboarding preview and saved preferences.
+- Parent topic selections expand to matching subtopics for source recommendation preview and downstream recommendation affinity.
+
+To seed curated `source_topics` and backfill `content_topics` in development:
+
+```bash
+source .env
+psql "$DATABASE_URL" -f scripts/backfill_topic_assignments.sql
+```
 
 ## Content processing setup
 

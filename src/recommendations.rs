@@ -38,24 +38,29 @@ pub async fn list_recommendation_topics(
     let rows = sqlx::query_as::<_, RecommendationTopicRow>(
         r#"
         select
-            id,
-            slug,
-            label,
-            description
-        from public.topics
-        order by label asc, slug asc
+            topic.id,
+            topic.slug,
+            topic.label,
+            topic.description,
+            topic.parent_topic_id
+        from public.topics topic
+        left join public.topics parent_topic
+          on parent_topic.id = topic.parent_topic_id
+        order by
+            coalesce(parent_topic.display_order, topic.display_order) asc,
+            case when topic.parent_topic_id is null then 0 else 1 end asc,
+            topic.display_order asc,
+            topic.label asc,
+            topic.slug asc
         "#,
     )
     .fetch_all(&state.pool)
     .await
     .map_err(map_recommendation_error)?;
 
-    let topics = rows
-        .into_iter()
-        .map(build_recommendation_topic)
-        .collect::<Vec<_>>();
-
-    Ok(Json(RecommendationTopicListResponse { topics }))
+    Ok(Json(RecommendationTopicListResponse {
+        topics: build_recommendation_topics(rows),
+    }))
 }
 
 pub async fn list_content_recommendations(
@@ -654,70 +659,8 @@ async fn fetch_public_source_recommendation_candidate_rows(
 ) -> ApiResult<Vec<RecommendationSourceCandidateRow>> {
     sqlx::query_as::<_, RecommendationSourceCandidateRow>(
         r#"
-        with matched_topic_sources as (
-            select
-                st.source_id,
-                least(sum(st.confidence), 2.0) as topic_score,
-                (
-                    array_agg(t.slug order by st.confidence desc, t.slug asc)
-                )[1] as primary_topic_slug
-            from public.source_topics st
-            join public.topics t on t.id = st.topic_id
-            where st.topic_id = any($1)
-            group by st.source_id
-        ),
-        recent_activity as (
-            select
-                c.source_id,
-                count(*)::bigint as recent_activity_count
-            from public.content c
-            where c.source_id in (select source_id from matched_topic_sources)
-              and c.parse_status = 'succeeded'
-              and c.parsed_document is not null
-              and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '30 days'
-              and (
-                  cardinality($2::text[]) = 0
-                  or c.language_code is null
-                  or c.language_code = any($2)
-              )
-            group by c.source_id
-        ),
-        source_halo as (
-            select
-                shd.source_id,
-                avg(shd.score) as source_halo_score
-            from public.source_halo_daily shd
-            where shd.source_id in (select source_id from matched_topic_sources)
-              and shd.halo_date >= current_date - 30
-            group by shd.source_id
-        )
-        select
-            cs.id as source_id,
-            cs.source_url,
-            cs.resolved_source_url,
-            cs.host as source_host,
-            cs.title as source_title,
-            cs.description as source_description,
-            cs.source_kind,
-            cs.refresh_status,
-            cs.last_refreshed_at,
-            sf.feed_url as primary_feed_url,
-            mts.topic_score,
-            mts.primary_topic_slug,
-            coalesce(sh.source_halo_score, 0.0) as source_halo_score,
-            coalesce(ra.recent_activity_count, 0)::bigint as recent_activity_count,
-            0.0::double precision as similarity_score
-        from matched_topic_sources mts
-        join public.content_sources cs on cs.id = mts.source_id
-        left join public.source_feeds sf on sf.id = cs.primary_feed_id
-        left join recent_activity ra on ra.source_id = mts.source_id
-        left join source_halo sh on sh.source_id = mts.source_id
-        where coalesce(ra.recent_activity_count, 0) > 0
-        order by
-            mts.topic_score desc,
-            coalesce(sh.source_halo_score, 0.0) desc,
-            coalesce(ra.recent_activity_count, 0) desc,
-            cs.id asc
+        select *
+        from public.get_public_source_recommendation_candidates($1, $2)
         "#,
     )
     .bind(topic_ids)
@@ -910,12 +853,43 @@ fn build_content_recommendation_item(
     })
 }
 
-fn build_recommendation_topic(row: RecommendationTopicRow) -> RecommendationTopic {
+fn build_recommendation_topics(rows: Vec<RecommendationTopicRow>) -> Vec<RecommendationTopic> {
+    let mut rows_by_parent = HashMap::<Option<Uuid>, Vec<RecommendationTopicRow>>::new();
+    for row in rows {
+        rows_by_parent
+            .entry(row.parent_topic_id)
+            .or_default()
+            .push(row);
+    }
+
+    build_recommendation_topic_branch(None, &mut rows_by_parent)
+}
+
+fn build_recommendation_topic_branch(
+    parent_topic_id: Option<Uuid>,
+    rows_by_parent: &mut HashMap<Option<Uuid>, Vec<RecommendationTopicRow>>,
+) -> Vec<RecommendationTopic> {
+    rows_by_parent
+        .remove(&parent_topic_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            let subtopics = build_recommendation_topic_branch(Some(row.id), rows_by_parent);
+            build_recommendation_topic(row, subtopics)
+        })
+        .collect()
+}
+
+fn build_recommendation_topic(
+    row: RecommendationTopicRow,
+    subtopics: Vec<RecommendationTopic>,
+) -> RecommendationTopic {
     RecommendationTopic {
         id: row.id,
         slug: row.slug,
         label: row.label,
         description: row.description,
+        subtopics,
     }
 }
 
@@ -1457,6 +1431,8 @@ pub struct RecommendationTopic {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subtopics: Vec<RecommendationTopic>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1788,13 +1764,15 @@ struct RecommendationTopicRow {
     slug: String,
     label: String,
     description: Option<String>,
+    parent_topic_id: Option<Uuid>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PublicInteractionEventType, PublicSourceRecommendationsRequest, RecommendationTopicRow,
-        build_recommendation_topic, freshness_score, normalize_language_codes,
+        PublicInteractionEventType, PublicSourceRecommendationsRequest,
+        RecommendationSourceCandidateRow, RecommendationTopicRow, build_recommendation_topic,
+        build_recommendation_topics, freshness_score, normalize_language_codes,
         normalize_positive_score, normalize_topic_slugs, preview_source_recommendations,
         validate_public_interaction_event,
     };
@@ -1805,9 +1783,12 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::{Json, extract::State};
     use serde_json::json;
-    use sqlx::postgres::PgPoolOptions;
-    use std::time::Duration;
+    use sqlx::{PgPool, Postgres, Transaction, migrate::Migrator, postgres::PgPoolOptions};
+    use std::{env, time::Duration};
+    use time::OffsetDateTime;
     use uuid::Uuid;
+
+    static TEST_MIGRATOR: Migrator = sqlx::migrate!();
 
     fn test_app_state() -> AppState {
         let config = SupabaseConfig {
@@ -1827,6 +1808,65 @@ mod tests {
                 .connect_lazy("postgresql://postgres:postgres@localhost/postgres")
                 .expect("lazy pool should parse"),
         }
+    }
+
+    async fn connect_test_database() -> PgPool {
+        dotenvy::dotenv().ok();
+        let database_url = env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set for database-backed recommendation tests");
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("database-backed recommendation tests should connect");
+
+        TEST_MIGRATOR
+            .run(&pool)
+            .await
+            .expect("database-backed recommendation tests should apply migrations");
+
+        pool
+    }
+
+    fn unique_test_uuid(suffix: u128) -> Uuid {
+        Uuid::from_u128((OffsetDateTime::now_utc().unix_timestamp_nanos() as u128) + suffix)
+    }
+
+    fn unique_test_slug(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        )
+    }
+
+    async fn insert_topic(
+        transaction: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+        slug: &str,
+        label: &str,
+        parent_topic_id: Option<Uuid>,
+    ) {
+        sqlx::query(
+            r#"
+            insert into public.topics (
+                id,
+                slug,
+                label,
+                description,
+                parent_topic_id,
+                display_order
+            )
+            values ($1, $2, $3, null, $4, 9999)
+            "#,
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(label)
+        .bind(parent_topic_id)
+        .execute(&mut **transaction)
+        .await
+        .expect("topic should insert");
     }
 
     #[test]
@@ -1903,18 +1943,284 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn topic_closure_contains_parent_child_relationships() {
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let parent_id = unique_test_uuid(10);
+        let child_id = unique_test_uuid(11);
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("db-topic-parent"),
+            "Database Topic Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            child_id,
+            &unique_test_slug("db-topic-child"),
+            "Database Topic Child",
+            Some(parent_id),
+        )
+        .await;
+
+        let parent_depth = sqlx::query_scalar::<_, i32>(
+            r#"
+            select depth
+            from public.topic_closure
+            where ancestor_topic_id = $1
+              and descendant_topic_id = $1
+            "#,
+        )
+        .bind(parent_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("self closure row should exist");
+        let child_depth = sqlx::query_scalar::<_, i32>(
+            r#"
+            select depth
+            from public.topic_closure
+            where ancestor_topic_id = $1
+              and descendant_topic_id = $2
+            "#,
+        )
+        .bind(parent_id)
+        .bind(child_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("parent-child closure row should exist");
+
+        assert_eq!(parent_depth, 0);
+        assert_eq!(child_depth, 1);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn topic_hierarchy_rejects_cycles() {
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let parent_id = unique_test_uuid(20);
+        let child_id = unique_test_uuid(21);
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("cycle-parent"),
+            "Cycle Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            child_id,
+            &unique_test_slug("cycle-child"),
+            "Cycle Child",
+            Some(parent_id),
+        )
+        .await;
+
+        let error = sqlx::query("update public.topics set parent_topic_id = $1 where id = $2")
+            .bind(child_id)
+            .bind(parent_id)
+            .execute(&mut *transaction)
+            .await
+            .expect_err("cycle update should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("topic hierarchy cannot contain cycles")
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn public_source_preview_expands_parent_topics_to_child_tagged_sources() {
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let parent_id = unique_test_uuid(30);
+        let child_id = unique_test_uuid(31);
+        let source_id = unique_test_uuid(32);
+        let content_id = unique_test_uuid(33);
+        let parent_slug = unique_test_slug("topic-preview-parent");
+        let child_slug = unique_test_slug("topic-preview-child");
+        let host = format!("{}.example.com", unique_test_slug("topic-preview-host"));
+        let source_url = format!("https://{host}/");
+        let canonical_url = format!("https://{host}/post");
+
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &parent_slug,
+            "Topic Preview Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            child_id,
+            &child_slug,
+            "Topic Preview Child",
+            Some(parent_id),
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            insert into public.content_sources (
+                id,
+                source_url,
+                host,
+                title,
+                source_kind,
+                refresh_status
+            )
+            values ($1, $2, $3, 'Topic Preview Source', 'website', 'succeeded')
+            "#,
+        )
+        .bind(source_id)
+        .bind(&source_url)
+        .bind(&host)
+        .execute(&mut *transaction)
+        .await
+        .expect("source should insert");
+
+        sqlx::query(
+            r#"
+            insert into public.source_topics (source_id, topic_id, confidence)
+            values ($1, $2, 0.95)
+            "#,
+        )
+        .bind(source_id)
+        .bind(child_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("source topic should insert");
+
+        sqlx::query(
+            r#"
+            insert into public.content (
+                id,
+                source_id,
+                canonical_url,
+                host,
+                title,
+                language_code,
+                parsed_document,
+                fetch_status,
+                parse_status,
+                published_at
+            )
+            values (
+                $1,
+                $2,
+                $3,
+                $4,
+                'Topic Preview Post',
+                'en',
+                '{}'::jsonb,
+                'succeeded',
+                'succeeded',
+                timezone('utc', now())
+            )
+            "#,
+        )
+        .bind(content_id)
+        .bind(source_id)
+        .bind(&canonical_url)
+        .bind(&host)
+        .execute(&mut *transaction)
+        .await
+        .expect("content should insert");
+
+        let rows = sqlx::query_as::<_, RecommendationSourceCandidateRow>(
+            r#"
+            select *
+            from public.get_public_source_recommendation_candidates($1, $2)
+            "#,
+        )
+        .bind(vec![parent_id])
+        .bind(vec!["en".to_string()])
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("preview query should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_id, source_id);
+        assert_eq!(
+            rows[0].primary_topic_slug.as_deref(),
+            Some(child_slug.as_str())
+        );
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
     #[test]
     fn builds_recommendation_topic_with_description() {
-        let topic = build_recommendation_topic(RecommendationTopicRow {
-            id: Uuid::nil(),
-            slug: "technology".to_string(),
-            label: "Technology".to_string(),
-            description: Some("Software and engineering".to_string()),
-        });
+        let topic = build_recommendation_topic(
+            RecommendationTopicRow {
+                id: Uuid::nil(),
+                slug: "technology".to_string(),
+                label: "Technology".to_string(),
+                description: Some("Software and engineering".to_string()),
+                parent_topic_id: None,
+            },
+            Vec::new(),
+        );
 
         let value = serde_json::to_value(topic).expect("topic should serialize");
         assert_eq!(value["slug"], "technology");
         assert_eq!(value["label"], "Technology");
         assert_eq!(value["description"], "Software and engineering");
+        assert!(value.get("subtopics").is_none());
+    }
+
+    #[test]
+    fn groups_subtopics_under_their_parent_topics() {
+        let technology_id = Uuid::from_u128(1);
+        let topics = build_recommendation_topics(vec![
+            RecommendationTopicRow {
+                id: technology_id,
+                slug: "technology".to_string(),
+                label: "Technology".to_string(),
+                description: None,
+                parent_topic_id: None,
+            },
+            RecommendationTopicRow {
+                id: Uuid::from_u128(2),
+                slug: "programming".to_string(),
+                label: "Programming".to_string(),
+                description: None,
+                parent_topic_id: Some(technology_id),
+            },
+            RecommendationTopicRow {
+                id: Uuid::from_u128(3),
+                slug: "science".to_string(),
+                label: "Science".to_string(),
+                description: None,
+                parent_topic_id: None,
+            },
+        ]);
+
+        let value = serde_json::to_value(topics).expect("topics should serialize");
+        assert_eq!(value.as_array().expect("array").len(), 2);
+        assert_eq!(value[0]["slug"], "technology");
+        assert_eq!(value[0]["subtopics"][0]["slug"], "programming");
+        assert!(value[1].get("subtopics").is_none());
     }
 }

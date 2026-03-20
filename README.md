@@ -23,7 +23,7 @@ For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SET
 Use this flow if you do not want the Supabase `service_role` key in the backend:
 
 1. Call `GET /recommendations/topics`.
-2. Call `POST /recommendations/sources/preview` with the user's selected `topic_slugs`.
+2. Call `POST /recommendations/sources/preview` with the user's selected topic or subtopic slugs.
 3. Call `POST /auth/signup` with only `username`, `email`, and `password`.
 4. Call `POST /auth/session`.
 5. Call `PUT /me/recommendation-preferences`.
@@ -97,13 +97,15 @@ PASSWORD='your-password'
 curl -sS "$API/recommendations/topics" | jq
 ```
 
+The response is hierarchical. Top-level topics include a `subtopics` array when narrower categories exist.
+
 ### 2. Preview onboarding sources
 
 ```bash
 curl -sS -X POST "$API/recommendations/sources/preview" \
   -H 'Content-Type: application/json' \
   -d '{
-    "topic_slugs": ["technology", "science"],
+    "topic_slugs": ["technology", "programming"],
     "language_codes": ["en"],
     "limit": 10
   }' \
@@ -324,13 +326,31 @@ Request body:
 
 #### `GET /recommendations/topics`
 
-List the public recommendation topics available for onboarding.
+List the public recommendation topics available for onboarding. The response is nested: each top-level topic can include `subtopics`.
 
 Example:
 
 ```bash
 curl -sS "$API/recommendations/topics" | jq
 ```
+
+### Topic Taxonomy Notes
+
+- Topics are hierarchical.
+- Both top-level topics and subtopics are selectable.
+- Selecting a parent topic like `technology` is treated as matching its subtopics, such as `programming`, `devices`, and `artificial-intelligence`.
+- The frontend should render the tree exactly as returned by `GET /recommendations/topics` and submit selected `slug` values back to the API.
+
+### Topic Backfill
+
+The topic tree itself is seeded by migrations. To seed `source_topics` and backfill `content_topics` for the current corpus, run:
+
+```bash
+source .env
+psql "$DATABASE_URL" -f scripts/backfill_topic_assignments.sql
+```
+
+The starter script currently includes curated host mappings for the existing dev corpus and then runs `public.backfill_content_topics_from_source_topics(...)`. Extend `scripts/backfill_topic_assignments.sql` as more sources are added.
 
 #### `GET /profiles/{username}`
 
