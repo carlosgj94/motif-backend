@@ -6,6 +6,7 @@ import {
   buildArticleBlocks,
   collectFaviconCandidates,
   collectMetadata,
+  discoverArticleSourceUrl,
   extractFallbackArticleHtml,
   extractThreadPosts,
   fetchDocument,
@@ -162,6 +163,61 @@ Deno.test("collectMetadata reads meta tags and falls back to time datetime", () 
     coverImageUrl: "https://example.com/cover.png",
     siteName: "CRA",
   });
+});
+
+Deno.test("discoverArticleSourceUrl prefers rel=home candidates", () => {
+  const document = documentFromHtml(`
+    <html>
+      <head>
+        <link rel="home" href="/blog/" />
+      </head>
+    </html>
+  `);
+
+  assertEquals(
+    discoverArticleSourceUrl(document, "https://example.com/posts/hello-world"),
+    "https://example.com/blog/",
+  );
+});
+
+Deno.test("discoverArticleSourceUrl uses related JSON-LD site urls and ignores unrelated publisher urls", () => {
+  const document = documentFromHtml(`
+    <html>
+      <head>
+        <script type="application/ld+json">
+          {
+            "@type": "Article",
+            "isPartOf": {
+              "@type": "WebSite",
+              "url": "https://example.com/journal/"
+            },
+            "publisher": {
+              "@type": "Organization",
+              "url": "https://facebook.com/example-publication"
+            }
+          }
+        </script>
+      </head>
+    </html>
+  `);
+
+  assertEquals(
+    discoverArticleSourceUrl(document, "https://example.com/posts/hello-world"),
+    "https://example.com/journal/",
+  );
+});
+
+Deno.test("discoverArticleSourceUrl falls back to the site root when metadata is absent", () => {
+  const document = documentFromHtml(`
+    <html>
+      <body><article><p>Hello world</p></article></body>
+    </html>
+  `);
+
+  assertEquals(
+    discoverArticleSourceUrl(document, "https://example.com/posts/hello-world"),
+    "https://example.com/",
+  );
 });
 
 Deno.test("collectFaviconCandidates prioritizes explicit icons before the fallback ico", () => {

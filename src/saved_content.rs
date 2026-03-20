@@ -28,7 +28,7 @@ use crate::{
     recommendations::{
         InternalEventType, record_internal_content_event, sync_recommendation_targets_for_signal,
     },
-    source_subscriptions::{enqueue_source_refresh, get_or_create_source, invoke_source_processor},
+    source_subscriptions::{enqueue_source_refresh, invoke_source_processor},
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
@@ -494,7 +494,16 @@ async fn attempt_source_discovery_for_saved_content(
                     return Ok(());
                 };
 
-                let source_id = get_or_create_source(&mut transaction, &source_candidate).await?;
+                let Some(source_id) =
+                    find_source_id_by_url(&mut transaction, &source_candidate).await?
+                else {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(map_saved_content_error)?;
+                    return Ok(());
+                };
+
                 link_content_to_source(&mut transaction, content_id, source_id).await?;
                 source_id
             }
@@ -534,6 +543,23 @@ async fn load_linked_source_id(
         "#,
     )
     .bind(content_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_saved_content_error)
+}
+
+async fn find_source_id_by_url(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_candidate: &NormalizedUrl,
+) -> ApiResult<Option<Uuid>> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select id
+        from public.content_sources
+        where source_url = $1
+        "#,
+    )
+    .bind(&source_candidate.canonical_url)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(map_saved_content_error)

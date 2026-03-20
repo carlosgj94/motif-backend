@@ -35,6 +35,22 @@ const MAX_THREAD_HANDLE_CHARS = 64;
 const MAX_THREAD_DISPLAY_NAME_CHARS = 128;
 const RETRY_DELAYS_SECONDS = [60, 300, 1800];
 const TRUSTED_FETCH_HOSTS = new Set(["publish.twitter.com"]);
+const NON_DISCOVERABLE_SOURCE_HOSTS = new Set([
+  "x.com",
+  "twitter.com",
+  "www.twitter.com",
+  "www.x.com",
+  "mobile.twitter.com",
+  "reddit.com",
+  "www.reddit.com",
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "medium.com",
+  "www.medium.com",
+  "linkedin.com",
+  "www.linkedin.com",
+]);
 const NOISY_ARTICLE_TAGS = new Set([
   "aside",
   "button",
@@ -130,6 +146,7 @@ interface ProcessedContent {
   imageCount: number;
   httpStatus: number;
   fetchedAt: string;
+  sourceDiscoveryUrl: string | null;
 }
 
 interface PartialContentUpdate {
@@ -382,6 +399,7 @@ async function processQueueMessage(
   try {
     const processed = await processClaimedContent(claimed);
     await persistSuccess(claimed.id, processed);
+    await attemptSourceDiscoveryForProcessedContent(claimed.id, processed);
     result.processed += 1;
   } catch (error) {
     const failure = ProcessingFailure.fromUnknown(error);
@@ -722,6 +740,10 @@ async function processArticleDocument(
     imageCount: metrics.imageCount,
     httpStatus: fetched.status,
     fetchedAt: fetched.fetchedAt,
+    sourceDiscoveryUrl: discoverArticleSourceUrl(
+      sourceDocument,
+      fetched.resolvedUrl,
+    ),
   };
 }
 
@@ -821,6 +843,7 @@ async function processXDocument(
     imageCount: metrics.imageCount,
     httpStatus: fetched.status,
     fetchedAt: fetched.fetchedAt,
+    sourceDiscoveryUrl: null,
   };
 }
 
@@ -868,6 +891,112 @@ async function persistSuccess(
     throw new Error(
       `Failed to persist processed content ${contentId}: ${error.message}`,
     );
+  }
+}
+
+async function attemptSourceDiscoveryForProcessedContent(
+  contentId: string,
+  processed: ProcessedContent,
+): Promise<void> {
+  if (processed.sourceKind !== "article") {
+    return;
+  }
+
+  const candidateUrl = processed.sourceDiscoveryUrl;
+  if (!candidateUrl) {
+    return;
+  }
+
+  try {
+    const supabase = getSupabase();
+    const { data: currentContent, error: currentContentError } = await supabase
+      .from("content")
+      .select("source_id")
+      .eq("id", contentId)
+      .maybeSingle();
+    if (currentContentError) {
+      throw new Error(
+        `Failed to load content source link for ${contentId}: ${currentContentError.message}`,
+      );
+    }
+    if ((currentContent as { source_id?: string | null } | null)?.source_id) {
+      return;
+    }
+
+    const validated = await validateFetchTargetUrl(candidateUrl);
+    const now = new Date().toISOString();
+    const { data: sourceRow, error: sourceError } = await supabase
+      .from("content_sources")
+      .upsert(
+        {
+          source_url: validated.url,
+          host: validated.host,
+          updated_at: now,
+        },
+        { onConflict: "source_url" },
+      )
+      .select("id")
+      .single();
+    if (sourceError) {
+      throw new Error(
+        `Failed to upsert discovered source for ${contentId}: ${sourceError.message}`,
+      );
+    }
+
+    const sourceId = (sourceRow as { id: string }).id;
+    const { error: linkError } = await supabase
+      .from("content")
+      .update({
+        source_id: sourceId,
+        updated_at: now,
+      })
+      .eq("id", contentId)
+      .is("source_id", null);
+    if (linkError) {
+      throw new Error(
+        `Failed to link content ${contentId} to discovered source ${sourceId}: ${linkError.message}`,
+      );
+    }
+
+    const { error: enqueueError } = await supabase.rpc("enqueue_source_refresh", {
+      p_source_id: sourceId,
+      p_trigger: "save",
+      p_delay_seconds: 0,
+      p_retry_count: 0,
+    });
+    if (enqueueError) {
+      throw new Error(
+        `Failed to enqueue source refresh for ${sourceId}: ${enqueueError.message}`,
+      );
+    }
+
+    const { data: invokeJobId, error: invokeError } = await supabase.rpc(
+      "invoke_source_processor",
+      {
+        p_payload: {
+          source_id: sourceId,
+          trigger: "save",
+        },
+      },
+    );
+    if (invokeError) {
+      throw new Error(
+        `Failed to invoke source processor for ${sourceId}: ${invokeError.message}`,
+      );
+    }
+    if (invokeJobId === null) {
+      console.warn("source processor invoke skipped because required Vault secrets are missing", {
+        contentId,
+        sourceId,
+        trigger: "save",
+      });
+    }
+  } catch (error) {
+    console.warn("processed content source discovery failed", {
+      contentId,
+      candidateUrl,
+      error,
+    });
   }
 }
 
@@ -1492,6 +1621,85 @@ export function collectMetadata(document: Document) {
   };
 }
 
+export function discoverArticleSourceUrl(
+  document: Document,
+  articleUrl: string,
+): string | null {
+  const article = normalizeDiscoveredSourceUrl(articleUrl, articleUrl, null);
+  if (!article) {
+    return null;
+  }
+  if (NON_DISCOVERABLE_SOURCE_HOSTS.has(article.host)) {
+    return null;
+  }
+
+  const scored = new Map<string, { score: number; pathDepth: number }>();
+  const pushCandidate = (rawUrl: string | null | undefined, score: number) => {
+    const normalized = normalizeDiscoveredSourceUrl(
+      articleUrl,
+      rawUrl,
+      article,
+    );
+    if (!normalized) {
+      return;
+    }
+
+    const existing = scored.get(normalized.url);
+    if (
+      !existing ||
+      score > existing.score ||
+      (score === existing.score && normalized.pathDepth < existing.pathDepth)
+    ) {
+      scored.set(normalized.url, {
+        score,
+        pathDepth: normalized.pathDepth,
+      });
+    }
+  };
+
+  for (
+    const element of Array.from(
+      document.querySelectorAll("link[rel][href], a[rel][href]"),
+    ) as Element[]
+  ) {
+    const rel = normalizeLinkRel(element.getAttribute("rel"));
+    if (!rel.includes("home")) {
+      continue;
+    }
+
+    pushCandidate(element.getAttribute("href"), 100);
+  }
+
+  for (const object of extractJsonLdObjects(document)) {
+    const types = normalizeJsonLdTypes(object["@type"]);
+    if (
+      types.includes("website") ||
+      types.includes("blog") ||
+      types.includes("collectionpage")
+    ) {
+      pushCandidate(stringValue(object.url), 95);
+    }
+
+    pushCandidate(stringValue(objectValue(object.isPartOf)?.url), 90);
+    pushCandidate(stringValue(objectValue(object.publisher)?.url), 70);
+  }
+
+  pushCandidate(buildRootSourceCandidate(article.url), 10);
+
+  return Array.from(scored.entries())
+    .sort((left, right) => {
+      if (right[1].score !== left[1].score) {
+        return right[1].score - left[1].score;
+      }
+      if (left[1].pathDepth !== right[1].pathDepth) {
+        return left[1].pathDepth - right[1].pathDepth;
+      }
+
+      return left[0].localeCompare(right[0]);
+    })
+    .map(([url]) => url)[0] ?? null;
+}
+
 function buildBaseUpdate(input: {
   fetched: FetchDocumentResult;
   metadata: ReturnType<typeof collectMetadata>;
@@ -1544,6 +1752,99 @@ function trimText(
 function trimUrl(value: string | null | undefined): string | null {
   const trimmed = trimText(value, MAX_URL_CHARS);
   return trimmed ? trimmed : null;
+}
+
+function normalizeDiscoveredSourceUrl(
+  baseUrl: string,
+  maybeUrl: string | null | undefined,
+  article: { url: string; host: string } | null,
+): { url: string; host: string; pathDepth: number } | null {
+  const resolved = resolveUrl(baseUrl, maybeUrl);
+  if (!resolved) {
+    return null;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(resolved);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  if (parsed.username || parsed.password) {
+    return null;
+  }
+
+  const defaultPort = parsed.protocol === "http:" ? "80" : "443";
+  if (parsed.port && parsed.port !== defaultPort) {
+    return null;
+  }
+
+  parsed.hash = "";
+  if (parsed.port === defaultPort) {
+    parsed.port = "";
+  }
+  parsed.search = "";
+
+  const host = normalizeHostValue(parsed.hostname);
+  if (!host || isDisallowedHostname(host)) {
+    return null;
+  }
+  if (NON_DISCOVERABLE_SOURCE_HOSTS.has(host)) {
+    return null;
+  }
+
+  if (article && !areRelatedHosts(host, article.host)) {
+    return null;
+  }
+
+  const url = parsed.toString();
+  if (article && url === article.url && parsed.pathname !== "/") {
+    return null;
+  }
+
+  return {
+    url,
+    host,
+    pathDepth: pathnameDepth(parsed.pathname),
+  };
+}
+
+function buildRootSourceCandidate(articleUrl: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(articleUrl);
+  } catch {
+    return null;
+  }
+
+  parsed.pathname = "/";
+  parsed.search = "";
+  parsed.hash = "";
+  const defaultPort = parsed.protocol === "http:" ? "80" : "443";
+  if (parsed.port === defaultPort) {
+    parsed.port = "";
+  }
+
+  return parsed.toString();
+}
+
+function areRelatedHosts(left: string, right: string): boolean {
+  const normalizedLeft = normalizeHostValue(left);
+  const normalizedRight = normalizeHostValue(right);
+  return normalizedLeft === normalizedRight ||
+    normalizedLeft.endsWith(`.${normalizedRight}`) ||
+    normalizedRight.endsWith(`.${normalizedLeft}`);
+}
+
+function pathnameDepth(pathname: string): number {
+  return pathname
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter(Boolean).length;
 }
 
 export function sanitizeParsedBlocks(blocks: ParsedBlock[]): ParsedBlock[] {
