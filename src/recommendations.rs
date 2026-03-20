@@ -30,7 +30,7 @@ const MAX_BATCH_EVENT_COUNT: usize = 50;
 const MAX_TOPIC_PREFERENCES: usize = 16;
 const MAX_LANGUAGE_PREFERENCES: usize = 8;
 const IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT: i32 = 10_000;
-const RECOMMENDATION_ALGORITHM_VERSION: &str = "v1-postgres-hybrid";
+const RECOMMENDATION_ALGORITHM_VERSION: &str = "v1-postgres-hybrid-quality-prior";
 
 pub async fn list_recommendation_topics(
     State(state): State<AppState>,
@@ -84,6 +84,7 @@ pub async fn list_content_recommendations(
             let source_affinity = normalize_positive_score(row.source_affinity_score);
             let content_halo = row.content_halo_score;
             let source_halo = row.source_halo_score;
+            let editorial_score = row.editorial_score;
             let freshness = freshness_score(row.published_at.unwrap_or(row.created_at), 30.0);
             let subscribed_inbox_boost = if row.subscribed_inbox
                 || row.source_id.is_some_and(|source_id| {
@@ -99,14 +100,17 @@ pub async fn list_content_recommendations(
                 0.0
             };
             let repeat_penalty = repeat_penalty(&row);
-            let final_score = (0.30 * topic_match)
-                + (0.20 * source_affinity)
-                + (0.15 * content_halo)
-                + (0.10 * source_halo)
-                + (0.10 * freshness)
-                + (0.10 * subscribed_inbox_boost)
-                + (0.05 * exploration_boost)
-                - repeat_penalty;
+            let final_score = score_content_recommendation(ContentScoreInputs {
+                topic_match,
+                source_affinity,
+                content_halo,
+                source_halo,
+                editorial_score,
+                freshness,
+                subscribed_inbox_boost,
+                exploration_boost,
+                repeat_penalty,
+            });
             let primary_topic_slug = row.primary_topic_slug.clone();
             let bucket_breakdown = json!({
                 "subscribed_inbox": row.subscribed_inbox,
@@ -124,6 +128,7 @@ pub async fn list_content_recommendations(
                     "source_affinity": source_affinity,
                     "content_halo": content_halo,
                     "source_halo": source_halo,
+                    "editorial_score": editorial_score,
                     "freshness": freshness,
                     "subscribed_inbox_boost": subscribed_inbox_boost,
                     "exploration_boost": exploration_boost,
@@ -177,11 +182,15 @@ pub async fn list_source_recommendations(
             let recent_activity_score = normalize_recent_activity(row.recent_activity_count);
             let similarity = row.similarity_score;
             let exploration_diversity = 1.0;
-            let final_score = (0.40 * topic_match)
-                + (0.20 * source_halo)
-                + (0.15 * similarity)
-                + (0.15 * recent_activity_score)
-                + (0.10 * exploration_diversity);
+            let editorial_score = row.editorial_score;
+            let final_score = score_source_recommendation(SourceScoreInputs {
+                topic_match,
+                editorial_score,
+                source_halo,
+                similarity,
+                recent_activity_score,
+                exploration_diversity,
+            });
             let primary_topic_slug = row.primary_topic_slug.clone();
 
             ScoredSourceCandidate {
@@ -190,6 +199,7 @@ pub async fn list_source_recommendations(
                 score: final_score.max(0.0),
                 score_breakdown: json!({
                     "topic_match": topic_match,
+                    "editorial_score": editorial_score,
                     "source_halo": source_halo,
                     "similarity_to_engaged_sources": similarity,
                     "recent_activity": recent_activity_score,
@@ -247,7 +257,13 @@ pub async fn preview_source_recommendations(
         let topic_match = normalize_positive_score(row.topic_score);
         let source_halo = row.source_halo_score;
         let recent_activity = normalize_recent_activity(row.recent_activity_count);
-        let final_score = (0.60 * topic_match) + (0.25 * source_halo) + (0.15 * recent_activity);
+        let editorial_score = row.editorial_score;
+        let final_score = score_public_source_preview(PublicSourcePreviewScoreInputs {
+            topic_match,
+            editorial_score,
+            source_halo,
+            recent_activity,
+        });
         let primary_topic_slug = row.primary_topic_slug.clone();
 
         ScoredSourceCandidate {
@@ -256,6 +272,7 @@ pub async fn preview_source_recommendations(
             score: final_score.max(0.0),
             score_breakdown: json!({
                 "topic_match": topic_match,
+                "editorial_score": editorial_score,
                 "source_halo": source_halo,
                 "recent_activity": recent_activity,
             }),
@@ -1302,6 +1319,62 @@ fn normalize_positive_score(score: f64) -> f64 {
     score.clamp(0.0, 2.0) / 2.0
 }
 
+struct ContentScoreInputs {
+    topic_match: f64,
+    source_affinity: f64,
+    content_halo: f64,
+    source_halo: f64,
+    editorial_score: f64,
+    freshness: f64,
+    subscribed_inbox_boost: f64,
+    exploration_boost: f64,
+    repeat_penalty: f64,
+}
+
+struct SourceScoreInputs {
+    topic_match: f64,
+    editorial_score: f64,
+    source_halo: f64,
+    similarity: f64,
+    recent_activity_score: f64,
+    exploration_diversity: f64,
+}
+
+struct PublicSourcePreviewScoreInputs {
+    topic_match: f64,
+    editorial_score: f64,
+    source_halo: f64,
+    recent_activity: f64,
+}
+
+fn score_content_recommendation(input: ContentScoreInputs) -> f64 {
+    ((0.25 * input.topic_match)
+        + (0.18 * input.source_affinity)
+        + (0.12 * input.content_halo)
+        + (0.08 * input.source_halo)
+        + (0.10 * input.editorial_score)
+        + (0.10 * input.freshness)
+        + (0.12 * input.subscribed_inbox_boost)
+        + (0.05 * input.exploration_boost))
+        - input.repeat_penalty
+}
+
+fn score_source_recommendation(input: SourceScoreInputs) -> f64 {
+    (0.32 * input.topic_match)
+        + (0.20 * input.editorial_score)
+        + (0.18 * input.source_halo)
+        + (0.12 * input.similarity)
+        + (0.10 * input.recent_activity_score)
+        + (0.08 * input.exploration_diversity)
+}
+
+fn score_public_source_preview(input: PublicSourcePreviewScoreInputs) -> f64 {
+    (0.50 * input.topic_match)
+        + (0.30 * input.editorial_score)
+        + (0.10 * input.source_halo)
+        + (0.10 * input.recent_activity)
+}
+
 fn freshness_score(timestamp: OffsetDateTime, window_days: f64) -> f64 {
     let age_days =
         ((OffsetDateTime::now_utc() - timestamp).whole_seconds() as f64 / 86_400.0).max(0.0);
@@ -1697,6 +1770,7 @@ struct RecommendationContentCandidateRow {
     source_affinity_score: f64,
     content_halo_score: f64,
     source_halo_score: f64,
+    editorial_score: f64,
     dismiss_count: i32,
     mark_read_count: i32,
     read_ratio: f64,
@@ -1719,6 +1793,7 @@ struct RecommendationSourceCandidateRow {
     source_halo_score: f64,
     recent_activity_count: i64,
     similarity_score: f64,
+    editorial_score: f64,
 }
 
 #[derive(Debug, FromRow)]
@@ -1770,10 +1845,12 @@ struct RecommendationTopicRow {
 #[cfg(test)]
 mod tests {
     use super::{
-        PublicInteractionEventType, PublicSourceRecommendationsRequest,
-        RecommendationSourceCandidateRow, RecommendationTopicRow, build_recommendation_topic,
+        ContentScoreInputs, PublicInteractionEventType, PublicSourcePreviewScoreInputs,
+        PublicSourceRecommendationsRequest, RecommendationSourceCandidateRow,
+        RecommendationTopicRow, SourceScoreInputs, build_recommendation_topic,
         build_recommendation_topics, freshness_score, normalize_language_codes,
         normalize_positive_score, normalize_topic_slugs, preview_source_recommendations,
+        score_content_recommendation, score_public_source_preview, score_source_recommendation,
         validate_public_interaction_event,
     };
     use crate::{
@@ -1925,6 +2002,74 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         assert!(freshness_score(now, 30.0) > 0.99);
         assert_eq!(freshness_score(now - time::Duration::days(45), 30.0), 0.0);
+    }
+
+    #[test]
+    fn source_recommendation_score_rewards_editorial_quality() {
+        let low_quality = score_source_recommendation(SourceScoreInputs {
+            topic_match: 0.6,
+            editorial_score: 0.1,
+            source_halo: 0.4,
+            similarity: 0.3,
+            recent_activity_score: 0.4,
+            exploration_diversity: 1.0,
+        });
+        let high_quality = score_source_recommendation(SourceScoreInputs {
+            topic_match: 0.6,
+            editorial_score: 1.0,
+            source_halo: 0.4,
+            similarity: 0.3,
+            recent_activity_score: 0.4,
+            exploration_diversity: 1.0,
+        });
+
+        assert!(high_quality > low_quality);
+    }
+
+    #[test]
+    fn public_source_preview_score_rewards_editorial_quality() {
+        let low_quality = score_public_source_preview(PublicSourcePreviewScoreInputs {
+            topic_match: 0.8,
+            editorial_score: 0.1,
+            source_halo: 0.2,
+            recent_activity: 0.3,
+        });
+        let high_quality = score_public_source_preview(PublicSourcePreviewScoreInputs {
+            topic_match: 0.8,
+            editorial_score: 1.0,
+            source_halo: 0.2,
+            recent_activity: 0.3,
+        });
+
+        assert!(high_quality > low_quality);
+    }
+
+    #[test]
+    fn content_recommendation_score_rewards_editorial_quality() {
+        let low_quality = score_content_recommendation(ContentScoreInputs {
+            topic_match: 0.7,
+            source_affinity: 0.6,
+            content_halo: 0.5,
+            source_halo: 0.4,
+            editorial_score: 0.1,
+            freshness: 0.8,
+            subscribed_inbox_boost: 0.0,
+            exploration_boost: 1.0,
+            repeat_penalty: 0.0,
+        });
+        let high_quality = score_content_recommendation(ContentScoreInputs {
+            topic_match: 0.7,
+            source_affinity: 0.6,
+            content_halo: 0.5,
+            source_halo: 0.4,
+            editorial_score: 1.0,
+            freshness: 0.8,
+            subscribed_inbox_boost: 0.0,
+            exploration_boost: 1.0,
+            repeat_penalty: 0.0,
+        });
+
+        assert!(high_quality > low_quality);
     }
 
     #[tokio::test]
