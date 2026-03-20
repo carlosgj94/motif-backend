@@ -501,8 +501,129 @@ impl SupabaseAuthError {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_auth_headers, normalize_email, normalize_password};
-    use axum::http::header::AUTHORIZATION;
+    use super::{
+        RefreshSessionRequest, SignUpRequest, SupabaseAuthApi, build_auth_headers,
+        normalize_email, normalize_password,
+    };
+    use crate::{
+        AppState, auth::SupabaseAuth, config::SupabaseConfig, rate_limit::AuthRateLimiter,
+    };
+    use axum::{
+        Json, Router,
+        extract::{ConnectInfo, Query, State},
+        http::{HeaderMap, header::AUTHORIZATION},
+        response::IntoResponse,
+        routing::post,
+    };
+    use serde::Deserialize;
+    use serde_json::{Value, json};
+    use sqlx::postgres::PgPoolOptions;
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct CapturedRefreshRequest {
+        query: HashMap<String, String>,
+        auth_header: String,
+        api_key_header: String,
+        body: Value,
+    }
+
+    #[derive(Clone)]
+    struct CaptureState {
+        sender: Arc<Mutex<Option<oneshot::Sender<CapturedRefreshRequest>>>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RefreshRequestBody {
+        refresh_token: String,
+    }
+
+    fn test_supabase_config(
+        url: String,
+        publishable_key: &str,
+        service_role_key: Option<&str>,
+    ) -> SupabaseConfig {
+        SupabaseConfig {
+            url: url.clone(),
+            issuer: format!("{url}/auth/v1"),
+            jwks_url: format!("{url}/auth/v1/.well-known/jwks.json"),
+            audience: "authenticated".to_string(),
+            jwks_cache_ttl: Duration::from_secs(300),
+            publishable_key: Some(publishable_key.to_string()),
+            service_role_key: service_role_key.map(ToOwned::to_owned),
+        }
+    }
+
+    fn test_app_state(service_role_key: Option<&str>) -> AppState {
+        let config = test_supabase_config(
+            "http://127.0.0.1:9999".to_string(),
+            "publishable-test-key",
+            service_role_key,
+        );
+
+        AppState {
+            auth: SupabaseAuth::new(config.clone()),
+            auth_api: SupabaseAuthApi::new(&config),
+            auth_rate_limiter: AuthRateLimiter::default(),
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgresql://postgres:postgres@localhost/postgres")
+                .expect("lazy pool should parse"),
+        }
+    }
+
+    async fn capture_refresh_request(
+        State(state): State<CaptureState>,
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+        Json(body): Json<RefreshRequestBody>,
+    ) -> impl IntoResponse {
+        let captured = CapturedRefreshRequest {
+            query,
+            auth_header: headers[AUTHORIZATION]
+                .to_str()
+                .expect("authorization header should be valid")
+                .to_string(),
+            api_key_header: headers["apikey"]
+                .to_str()
+                .expect("apikey header should be valid")
+                .to_string(),
+            body: json!({
+                "refresh_token": body.refresh_token,
+            }),
+        };
+
+        if let Some(sender) = state
+            .sender
+            .lock()
+            .expect("mutex should not be poisoned")
+            .take()
+        {
+            let _ = sender.send(captured);
+        }
+
+        Json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "expires_at": 1775000000,
+            "user": {
+                "id": Uuid::nil(),
+                "email": "user@example.com",
+                "role": "authenticated",
+                "email_confirmed_at": null,
+                "user_metadata": {},
+                "app_metadata": {}
+            }
+        }))
+    }
 
     #[test]
     fn normalizes_email_to_lowercase() {
@@ -522,5 +643,105 @@ mod tests {
         let headers = build_auth_headers("test-key").expect("headers should build");
         assert_eq!(headers["apikey"], "test-key");
         assert_eq!(headers[AUTHORIZATION], "Bearer test-key");
+    }
+
+    #[test]
+    fn rejects_empty_refresh_token() {
+        assert!(super::normalize_refresh_token("   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_session_uses_refresh_token_grant_type() {
+        let (sender, receiver) = oneshot::channel();
+        let capture_state = CaptureState {
+            sender: Arc::new(Mutex::new(Some(sender))),
+        };
+        let app = Router::new()
+            .route("/auth/v1/token", post(capture_refresh_request))
+            .with_state(capture_state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server should run");
+        });
+
+        let config = test_supabase_config(
+            format!("http://{address}"),
+            "publishable-test-key",
+            Some("service-role-key"),
+        );
+        let auth_api = SupabaseAuthApi::new(&config);
+        let response = auth_api
+            .refresh_session(RefreshSessionRequest {
+                refresh_token: "refresh-token-123".to_string(),
+            })
+            .await
+            .expect("refresh should succeed");
+
+        let captured = receiver.await.expect("request should be captured");
+        server.abort();
+
+        assert_eq!(
+            captured.query.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(captured.auth_header, "Bearer publishable-test-key");
+        assert_eq!(captured.api_key_header, "publishable-test-key");
+        assert_eq!(
+            captured.body,
+            json!({ "refresh_token": "refresh-token-123" })
+        );
+        assert_eq!(
+            response
+                .session
+                .expect("session should be present")
+                .access_token,
+            "new-access-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_up_rejects_onboarding_without_service_role_key() {
+        let state = test_app_state(None);
+        let result = super::sign_up(
+            State(state),
+            ConnectInfo("127.0.0.1:4000".parse::<SocketAddr>().unwrap()),
+            Json(SignUpRequest {
+                username: "reader01".to_string(),
+                email: "user@example.com".to_string(),
+                password: "password123".to_string(),
+                topic_slugs: Vec::new(),
+                language_codes: vec!["en".to_string()],
+                source_ids: Vec::new(),
+            }),
+        )
+        .await;
+
+        let response = result.expect_err("signup should fail").into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_handler_rejects_empty_refresh_token() {
+        let state = test_app_state(Some("service-role-key"));
+        let result = super::refresh_session(
+            State(state),
+            ConnectInfo("127.0.0.1:4000".parse::<SocketAddr>().unwrap()),
+            Json(RefreshSessionRequest {
+                refresh_token: "   ".to_string(),
+            }),
+        )
+        .await;
+
+        let response = result.expect_err("refresh should fail").into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }

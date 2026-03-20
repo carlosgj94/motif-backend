@@ -1750,12 +1750,41 @@ struct RecommendationPreferencesRow {
 #[cfg(test)]
 mod tests {
     use super::{
-        PublicInteractionEventType, freshness_score, normalize_language_codes,
-        normalize_positive_score, normalize_topic_slugs, validate_public_interaction_event,
+        PublicInteractionEventType, PublicSourceRecommendationsRequest, freshness_score,
+        normalize_language_codes, normalize_positive_score, normalize_topic_slugs,
+        preview_source_recommendations, validate_public_interaction_event,
+    };
+    use crate::{
+        AppState, auth::SupabaseAuth, auth_api::SupabaseAuthApi, config::SupabaseConfig,
+        rate_limit::AuthRateLimiter,
     };
     use axum::response::IntoResponse;
+    use axum::{Json, extract::State};
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    fn test_app_state() -> AppState {
+        let config = SupabaseConfig {
+            url: "http://127.0.0.1:9999".to_string(),
+            issuer: "http://127.0.0.1:9999/auth/v1".to_string(),
+            jwks_url: "http://127.0.0.1:9999/auth/v1/.well-known/jwks.json".to_string(),
+            audience: "authenticated".to_string(),
+            jwks_cache_ttl: Duration::from_secs(300),
+            publishable_key: Some("publishable-test-key".to_string()),
+            service_role_key: Some("service-role-key".to_string()),
+        };
+
+        AppState {
+            auth: SupabaseAuth::new(config.clone()),
+            auth_api: SupabaseAuthApi::new(&config),
+            auth_rate_limiter: AuthRateLimiter::default(),
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgresql://postgres:postgres@localhost/postgres")
+                .expect("lazy pool should parse"),
+        }
+    }
 
     #[test]
     fn normalizes_topic_slugs_and_deduplicates() {
@@ -1813,5 +1842,21 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         assert!(freshness_score(now, 30.0) > 0.99);
         assert_eq!(freshness_score(now - time::Duration::days(45), 30.0), 0.0);
+    }
+
+    #[tokio::test]
+    async fn preview_source_recommendations_requires_topics() {
+        let result = preview_source_recommendations(
+            State(test_app_state()),
+            Json(PublicSourceRecommendationsRequest {
+                topic_slugs: Vec::new(),
+                language_codes: vec!["en".to_string()],
+                limit: Some(10),
+            }),
+        )
+        .await;
+
+        let response = result.expect_err("preview should fail").into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }
