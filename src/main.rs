@@ -60,6 +60,11 @@ async fn main() {
         .route("/health", get(profile::health))
         .route("/auth/signup", post(auth_api::sign_up))
         .route("/auth/session", post(auth_api::create_session))
+        .route("/auth/session/refresh", post(auth_api::refresh_session))
+        .route(
+            "/recommendations/sources/preview",
+            post(recommendations::preview_source_recommendations),
+        )
         .route("/me", get(profile::me))
         .route("/me/profile", put(profile::upsert_my_profile))
         .route(

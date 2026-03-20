@@ -13,6 +13,7 @@ Copy `.env.example` to `.env` and set:
 - `DATABASE_URL`: use the Supabase session pooler on port `5432`
 - `SUPABASE_URL`: your project URL, for example `https://<project-ref>.supabase.co`
 - `SUPABASE_PUBLISHABLE_KEY`: required for `POST /auth/signup` and `POST /auth/session`
+- `SUPABASE_SERVICE_ROLE_KEY`: required for atomic signup onboarding with topics and source subscriptions
 - `SUPABASE_JWT_AUDIENCE`: leave as `authenticated` unless you changed your JWT audience
 - `DB_MAX_CONNECTIONS`: defaults to `10`
 
@@ -46,6 +47,8 @@ Copy `.env.example` to `.env` and set:
 - `GET /health`: liveness check
 - `POST /auth/signup`: create an email/password auth user and store `username` in Supabase user metadata
 - `POST /auth/session`: sign in with email/password and receive a Supabase session payload
+- `POST /auth/session/refresh`: exchange a refresh token for a fresh session payload
+- `POST /recommendations/sources/preview`: get pre-auth source recommendations for onboarding topic selections
 - `GET /me`: returns the verified Supabase user plus any claimed app profile
 - `PUT /me/profile`: create or update the authenticated user's app profile
 - `GET /profiles/:username`: fetch a public profile by username
@@ -53,11 +56,13 @@ Copy `.env.example` to `.env` and set:
 ## Expected client flow
 
 1. Sign up with `email + password` in the browser with Supabase Auth.
-2. If you are testing from the backend first, call `POST /auth/signup`.
-3. Create a session with `POST /auth/session`.
-4. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
-5. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
-6. Send `Authorization: Bearer <access_token>` on protected API calls.
+2. Optionally call `POST /recommendations/sources/preview` with onboarding topic selections before the user exists.
+3. If you are testing from the backend first, call `POST /auth/signup` with optional onboarding `topic_slugs`, `language_codes`, and `source_ids`.
+4. Create a session with `POST /auth/session`.
+5. Refresh sessions with `POST /auth/session/refresh` when you need a fresh access token.
+6. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
+7. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
+8. Send `Authorization: Bearer <access_token>` on protected API calls.
 
 ## Content processing setup
 

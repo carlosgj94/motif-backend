@@ -14,6 +14,11 @@ use crate::{
     config::SupabaseConfig,
     error::{ApiError, ApiResult},
     profile::normalize_username,
+    recommendations::{
+        apply_recommendation_preferences, rollup_and_refresh_recommendation_state,
+        validate_recommendation_preferences,
+    },
+    source_subscriptions::{subscribe_user_to_sources, validate_existing_source_ids},
 };
 
 #[derive(Clone)]
@@ -21,6 +26,7 @@ pub struct SupabaseAuthApi {
     api_key: Option<String>,
     api_url: String,
     client: Client,
+    service_role_key: Option<String>,
 }
 
 impl SupabaseAuthApi {
@@ -39,6 +45,7 @@ impl SupabaseAuthApi {
             api_key: config.publishable_key.clone(),
             api_url: format!("{}/auth/v1", config.url),
             client,
+            service_role_key: config.service_role_key.clone(),
         }
     }
 
@@ -76,6 +83,64 @@ impl SupabaseAuthApi {
             }),
         )
         .await
+    }
+
+    pub async fn refresh_session(
+        &self,
+        request: RefreshSessionRequest,
+    ) -> Result<AuthFlowResponse, ApiError> {
+        let refresh_token = normalize_refresh_token(&request.refresh_token)?;
+
+        self.send_auth_request(
+            self.client
+                .post(format!("{}/token?grant_type=refresh_token", self.api_url)),
+            json!({
+                "refresh_token": refresh_token,
+            }),
+        )
+        .await
+    }
+
+    pub fn supports_atomic_onboarding(&self) -> bool {
+        self.service_role_key.is_some()
+    }
+
+    pub async fn delete_user(&self, user_id: Uuid) -> Result<(), ApiError> {
+        let service_role_key = self.service_role_key.as_deref().ok_or_else(|| {
+            ApiError::internal("SUPABASE_SERVICE_ROLE_KEY must be set to delete auth users")
+        })?;
+        let headers = build_auth_headers(service_role_key)?;
+        let response = self
+            .client
+            .delete(format!("{}/admin/users/{}", self.api_url, user_id))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, %user_id, "failed to call Supabase admin delete user API");
+                ApiError::internal("Failed to reach Supabase auth API")
+            })?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response.bytes().await.map_err(|error| {
+            tracing::error!(error = %error, %user_id, "failed to read Supabase auth delete user response body");
+            ApiError::internal("Failed to read Supabase auth response")
+        })?;
+        let provider_error = serde_json::from_slice::<SupabaseAuthError>(&body).ok();
+        let message = provider_error
+            .as_ref()
+            .and_then(SupabaseAuthError::message)
+            .unwrap_or("Supabase auth delete user request failed");
+
+        Err(ApiError::with_status(
+            map_upstream_status(status),
+            "auth_provider_error",
+            message,
+        ))
     }
 
     async fn send_auth_request(
@@ -135,13 +200,66 @@ pub async fn sign_up(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<SignUpRequest>,
 ) -> ApiResult<Json<AuthFlowResponse>> {
+    let validated_preferences = validate_recommendation_preferences(
+        &state.pool,
+        &payload.topic_slugs,
+        &payload.language_codes,
+    )
+    .await?;
+    let validated_source_ids =
+        validate_existing_source_ids(&state.pool, &payload.source_ids).await?;
+    let has_onboarding = !validated_preferences.is_empty() || !validated_source_ids.is_empty();
+    if has_onboarding && !state.auth_api.supports_atomic_onboarding() {
+        return Err(ApiError::internal(
+            "SUPABASE_SERVICE_ROLE_KEY must be set to use onboarding fields during signup",
+        ));
+    }
+
     enforce_auth_rate_limit(
         &state,
         remote_addr,
         AuthRouteKind::SignUp,
         normalize_email(&payload.email)?,
     )?;
-    state.auth_api.sign_up(payload).await.map(Json)
+    let response = state.auth_api.sign_up(payload).await?;
+    if !has_onboarding {
+        return Ok(Json(response));
+    }
+
+    let user_id = response
+        .user
+        .as_ref()
+        .map(|user| user.id)
+        .ok_or_else(|| ApiError::internal("Supabase signup response did not include a user"))?;
+
+    let onboarding_result = async {
+        let mut transaction = state.pool.begin().await.map_err(map_signup_error)?;
+        apply_recommendation_preferences(&mut transaction, user_id, &validated_preferences).await?;
+        subscribe_user_to_sources(
+            &mut transaction,
+            user_id,
+            &validated_source_ids,
+            "auth_signup",
+        )
+        .await?;
+        rollup_and_refresh_recommendation_state(&mut transaction, user_id).await?;
+        transaction.commit().await.map_err(map_signup_error)?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+
+    if let Err(error) = onboarding_result {
+        if let Err(cleanup_error) = state.auth_api.delete_user(user_id).await {
+            tracing::error!(
+                error = ?cleanup_error,
+                %user_id,
+                "failed to roll back auth user after signup onboarding error",
+            );
+        }
+        return Err(error);
+    }
+
+    Ok(Json(response))
 }
 
 pub async fn create_session(
@@ -156,6 +274,15 @@ pub async fn create_session(
         normalize_email(&payload.email)?,
     )?;
     state.auth_api.create_session(payload).await.map(Json)
+}
+
+pub async fn refresh_session(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<RefreshSessionRequest>,
+) -> ApiResult<Json<AuthFlowResponse>> {
+    enforce_auth_refresh_rate_limit(&state, remote_addr, &payload.refresh_token)?;
+    state.auth_api.refresh_session(payload).await.map(Json)
 }
 
 fn build_auth_headers(api_key: &str) -> Result<HeaderMap, ApiError> {
@@ -191,6 +318,15 @@ fn normalize_password(input: &str) -> ApiResult<String> {
     Ok(password)
 }
 
+fn normalize_refresh_token(input: &str) -> ApiResult<String> {
+    let refresh_token = input.trim().to_string();
+    if refresh_token.is_empty() {
+        return Err(ApiError::bad_request("refresh_token must be provided"));
+    }
+
+    Ok(refresh_token)
+}
+
 fn map_upstream_status(status: StatusCode) -> StatusCode {
     match status {
         StatusCode::BAD_REQUEST
@@ -223,17 +359,43 @@ fn enforce_auth_rate_limit(
     }
 }
 
-#[derive(Debug, Deserialize)]
+fn enforce_auth_refresh_rate_limit(
+    state: &AppState,
+    remote_addr: SocketAddr,
+    refresh_token: &str,
+) -> ApiResult<()> {
+    state
+        .auth_rate_limiter
+        .check_session_refresh(remote_addr.ip(), refresh_token)
+}
+
+fn map_signup_error(error: sqlx::Error) -> ApiError {
+    tracing::error!(error = %error, "signup onboarding transaction failed");
+    ApiError::internal("Database operation failed")
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SignUpRequest {
     pub username: String,
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub topic_slugs: Vec<String>,
+    #[serde(default)]
+    pub language_codes: Vec<String>,
+    #[serde(default)]
+    pub source_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub email: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshSessionRequest {
+    pub refresh_token: String,
 }
 
 #[derive(Debug, Serialize)]

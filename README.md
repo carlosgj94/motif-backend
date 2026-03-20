@@ -26,6 +26,8 @@ For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SET
 - `GET /health`
 - `POST /auth/signup`
 - `POST /auth/session`
+- `POST /auth/session/refresh`
+- `POST /recommendations/sources/preview`
 - `GET /profiles/{username}`
 
 ### Profile
@@ -85,7 +87,10 @@ curl -sS -X POST "$API/auth/signup" \
   -d '{
     "username": "reader01",
     "email": "'"$EMAIL"'",
-    "password": "'"$PASSWORD"'"
+    "password": "'"$PASSWORD"'",
+    "topic_slugs": ["technology", "science"],
+    "language_codes": ["en"],
+    "source_ids": ["source-id-from-preview"]
   }' \
   | jq
 ```
@@ -102,6 +107,17 @@ TOKEN=$(
     }' \
   | jq -r '.session.access_token'
 )
+```
+
+### 2b. Refresh a session
+
+```bash
+curl -sS -X POST "$API/auth/session/refresh" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "refresh_token": "'"$REFRESH_TOKEN"'"
+  }' \
+  | jq
 ```
 
 ### 3. Fetch the library
@@ -540,6 +556,20 @@ Example:
 curl -sS "$API/me/recommendations/sources?limit=10" \
   -H "Authorization: Bearer $TOKEN" \
   | jq
+```
+
+#### `POST /recommendations/sources/preview`
+
+Get public source recommendations for onboarding before a user exists.
+
+Request body:
+
+```json
+{
+  "topic_slugs": ["technology", "science"],
+  "language_codes": ["en"],
+  "limit": 10
+}
 ```
 
 #### `PUT /me/recommendation-preferences`

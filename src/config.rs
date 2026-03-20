@@ -16,6 +16,7 @@ pub struct SupabaseConfig {
     pub audience: String,
     pub jwks_cache_ttl: Duration,
     pub publishable_key: Option<String>,
+    pub service_role_key: Option<String>,
 }
 
 impl Config {
@@ -47,6 +48,7 @@ impl Config {
         let publishable_key = env::var("SUPABASE_PUBLISHABLE_KEY")
             .ok()
             .or_else(|| env::var("SUPABASE_ANON_KEY").ok());
+        let service_role_key = env::var("SUPABASE_SERVICE_ROLE_KEY").ok();
 
         let issuer =
             env::var("SUPABASE_JWT_ISSUER").unwrap_or_else(|_| format!("{supabase_url}/auth/v1"));
@@ -83,6 +85,7 @@ impl Config {
                 audience,
                 jwks_cache_ttl,
                 publishable_key,
+                service_role_key,
             },
         })
     }

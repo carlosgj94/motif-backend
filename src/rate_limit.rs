@@ -34,6 +34,10 @@ impl AuthRateLimiter {
         self.check(AuthRoute::Session, ip, email, Instant::now())
     }
 
+    pub fn check_session_refresh(&self, ip: IpAddr, refresh_token: &str) -> ApiResult<()> {
+        self.check(AuthRoute::SessionRefresh, ip, refresh_token, Instant::now())
+    }
+
     fn check(&self, route: AuthRoute, ip: IpAddr, email: &str, now: Instant) -> ApiResult<()> {
         let mut state = self
             .inner
@@ -77,6 +81,7 @@ struct LimiterState {
 enum AuthRoute {
     SignUp,
     Session,
+    SessionRefresh,
 }
 
 impl AuthRoute {
@@ -88,6 +93,11 @@ impl AuthRoute {
                 window: SIGN_UP_WINDOW,
             },
             Self::Session => RateLimitRule {
+                ip_limit: SESSION_IP_LIMIT,
+                email_limit: SESSION_EMAIL_LIMIT,
+                window: SESSION_WINDOW,
+            },
+            Self::SessionRefresh => RateLimitRule {
                 ip_limit: SESSION_IP_LIMIT,
                 email_limit: SESSION_EMAIL_LIMIT,
                 window: SESSION_WINDOW,

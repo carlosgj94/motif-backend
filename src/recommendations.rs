@@ -188,6 +188,61 @@ pub async fn list_source_recommendations(
     Ok(Json(SourceRecommendationListResponse { serve_id, sources }))
 }
 
+pub async fn preview_source_recommendations(
+    State(state): State<AppState>,
+    Json(payload): Json<PublicSourceRecommendationsRequest>,
+) -> ApiResult<Json<PublicSourceRecommendationListResponse>> {
+    let limit = normalize_recommendation_limit(payload.limit)?;
+    let validated_preferences = validate_recommendation_preferences(
+        &state.pool,
+        &payload.topic_slugs,
+        &payload.language_codes,
+    )
+    .await?;
+    if validated_preferences.topic_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "At least one topic slug must be provided",
+        ));
+    }
+
+    let mut scored = fetch_public_source_recommendation_candidate_rows(
+        &state.pool,
+        &validated_preferences.topic_ids,
+        &validated_preferences.language_codes,
+    )
+    .await?
+    .into_iter()
+    .map(|row| {
+        let topic_match = normalize_positive_score(row.topic_score);
+        let source_halo = row.source_halo_score;
+        let recent_activity = normalize_recent_activity(row.recent_activity_count);
+        let final_score = (0.60 * topic_match) + (0.25 * source_halo) + (0.15 * recent_activity);
+        let primary_topic_slug = row.primary_topic_slug.clone();
+
+        ScoredSourceCandidate {
+            row,
+            primary_topic_slug,
+            score: final_score.max(0.0),
+            score_breakdown: json!({
+                "topic_match": topic_match,
+                "source_halo": source_halo,
+                "recent_activity": recent_activity,
+            }),
+        }
+    })
+    .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| right.score.total_cmp(&left.score));
+    let selected = apply_source_diversity(scored, limit as usize);
+    let sources = selected
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| build_public_source_recommendation_item(index, candidate))
+        .collect::<ApiResult<Vec<_>>>()?;
+
+    Ok(Json(PublicSourceRecommendationListResponse { sources }))
+}
+
 pub async fn get_content_detail(
     _user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -264,55 +319,16 @@ pub async fn update_recommendation_preferences(
     State(state): State<AppState>,
     Json(payload): Json<UpdateRecommendationPreferencesRequest>,
 ) -> ApiResult<Json<RecommendationPreferencesResponse>> {
-    let topic_slugs = normalize_topic_slugs(&payload.topic_slugs)?;
-    let language_codes = normalize_language_codes(&payload.language_codes)?;
-    let topics = fetch_topics_by_slugs(&state.pool, &topic_slugs).await?;
-    if topics.len() != topic_slugs.len() {
-        return Err(ApiError::bad_request("At least one topic slug is invalid"));
-    }
+    let validated_preferences = validate_recommendation_preferences(
+        &state.pool,
+        &payload.topic_slugs,
+        &payload.language_codes,
+    )
+    .await?;
 
     let mut transaction = state.pool.begin().await.map_err(map_recommendation_error)?;
-    sqlx::query(
-        r#"
-        insert into public.user_recommendation_settings (user_id, preferred_languages)
-        values ($1, $2)
-        on conflict (user_id) do update
-        set preferred_languages = excluded.preferred_languages
-        "#,
-    )
-    .bind(user.user_id)
-    .bind(&language_codes)
-    .execute(&mut *transaction)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    sqlx::query(
-        r#"
-        delete from public.user_topic_preferences
-        where user_id = $1
-        "#,
-    )
-    .bind(user.user_id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(map_recommendation_error)?;
-
-    if !topics.is_empty() {
-        let mut builder = QueryBuilder::<Postgres>::new(
-            "insert into public.user_topic_preferences (user_id, topic_id, weight) ",
-        );
-        builder.push_values(topics.iter(), |mut row, topic| {
-            row.push_bind(user.user_id)
-                .push_bind(topic.id)
-                .push_bind(1.0_f64);
-        });
-        builder
-            .build()
-            .execute(&mut *transaction)
-            .await
-            .map_err(map_recommendation_error)?;
-    }
-
+    apply_recommendation_preferences(&mut transaction, user.user_id, &validated_preferences)
+        .await?;
     refresh_recommendation_targets(&mut transaction, Some(user.user_id), None, None).await?;
     transaction
         .commit()
@@ -472,6 +488,81 @@ async fn load_user_recommendation_context(
     })
 }
 
+pub(crate) async fn validate_recommendation_preferences(
+    pool: &PgPool,
+    topic_slugs: &[String],
+    language_codes: &[String],
+) -> ApiResult<ValidatedRecommendationPreferences> {
+    let topic_slugs = normalize_topic_slugs(topic_slugs)?;
+    let language_codes = normalize_language_codes(language_codes)?;
+    let topics = fetch_topics_by_slugs(pool, &topic_slugs).await?;
+    if topics.len() != topic_slugs.len() {
+        return Err(ApiError::bad_request("At least one topic slug is invalid"));
+    }
+
+    Ok(ValidatedRecommendationPreferences {
+        language_codes,
+        topic_ids: topics.into_iter().map(|topic| topic.id).collect(),
+    })
+}
+
+pub(crate) async fn apply_recommendation_preferences(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    preferences: &ValidatedRecommendationPreferences,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        insert into public.user_recommendation_settings (user_id, preferred_languages)
+        values ($1, $2)
+        on conflict (user_id) do update
+        set preferred_languages = excluded.preferred_languages
+        "#,
+    )
+    .bind(user_id)
+    .bind(&preferences.language_codes)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_recommendation_error)?;
+
+    sqlx::query(
+        r#"
+        delete from public.user_topic_preferences
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_recommendation_error)?;
+
+    if !preferences.topic_ids.is_empty() {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "insert into public.user_topic_preferences (user_id, topic_id, weight) ",
+        );
+        builder.push_values(preferences.topic_ids.iter(), |mut row, topic_id| {
+            row.push_bind(user_id)
+                .push_bind(*topic_id)
+                .push_bind(1.0_f64);
+        });
+        builder
+            .build()
+            .execute(&mut **transaction)
+            .await
+            .map_err(map_recommendation_error)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn rollup_and_refresh_recommendation_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    rollup_interaction_events(transaction, IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT).await?;
+    refresh_recommendation_targets(transaction, Some(user_id), None, None).await
+}
+
 async fn load_recommendation_preferences(
     pool: &PgPool,
     user_id: Uuid,
@@ -533,6 +624,86 @@ async fn fetch_source_recommendation_candidate_rows(
         "#,
     )
     .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_recommendation_error)
+}
+
+async fn fetch_public_source_recommendation_candidate_rows(
+    pool: &PgPool,
+    topic_ids: &[Uuid],
+    language_codes: &[String],
+) -> ApiResult<Vec<RecommendationSourceCandidateRow>> {
+    sqlx::query_as::<_, RecommendationSourceCandidateRow>(
+        r#"
+        with matched_topic_sources as (
+            select
+                st.source_id,
+                least(sum(st.confidence), 2.0) as topic_score,
+                (
+                    array_agg(t.slug order by st.confidence desc, t.slug asc)
+                )[1] as primary_topic_slug
+            from public.source_topics st
+            join public.topics t on t.id = st.topic_id
+            where st.topic_id = any($1)
+            group by st.source_id
+        ),
+        recent_activity as (
+            select
+                c.source_id,
+                count(*)::bigint as recent_activity_count
+            from public.content c
+            where c.source_id in (select source_id from matched_topic_sources)
+              and c.parse_status = 'succeeded'
+              and c.parsed_document is not null
+              and coalesce(c.published_at, c.created_at) >= timezone('utc', now()) - interval '30 days'
+              and (
+                  cardinality($2::text[]) = 0
+                  or c.language_code is null
+                  or c.language_code = any($2)
+              )
+            group by c.source_id
+        ),
+        source_halo as (
+            select
+                shd.source_id,
+                avg(shd.score) as source_halo_score
+            from public.source_halo_daily shd
+            where shd.source_id in (select source_id from matched_topic_sources)
+              and shd.halo_date >= current_date - 30
+            group by shd.source_id
+        )
+        select
+            cs.id as source_id,
+            cs.source_url,
+            cs.resolved_source_url,
+            cs.host as source_host,
+            cs.title as source_title,
+            cs.description as source_description,
+            cs.source_kind,
+            cs.refresh_status,
+            cs.last_refreshed_at,
+            sf.feed_url as primary_feed_url,
+            mts.topic_score,
+            mts.primary_topic_slug,
+            coalesce(sh.source_halo_score, 0.0) as source_halo_score,
+            coalesce(ra.recent_activity_count, 0)::bigint as recent_activity_count,
+            0.0::double precision as similarity_score
+        from matched_topic_sources mts
+        join public.content_sources cs on cs.id = mts.source_id
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
+        left join recent_activity ra on ra.source_id = mts.source_id
+        left join source_halo sh on sh.source_id = mts.source_id
+        where coalesce(ra.recent_activity_count, 0) > 0
+        order by
+            mts.topic_score desc,
+            coalesce(sh.source_halo_score, 0.0) desc,
+            coalesce(ra.recent_activity_count, 0) desc,
+            cs.id asc
+        "#,
+    )
+    .bind(topic_ids)
+    .bind(language_codes)
     .fetch_all(pool)
     .await
     .map_err(map_recommendation_error)
@@ -725,24 +896,42 @@ fn build_source_recommendation_item(
     position: usize,
     candidate: ScoredSourceCandidate,
 ) -> ApiResult<SourceRecommendationItem> {
+    let source = build_recommendation_source_summary(candidate.row)?;
+
     Ok(SourceRecommendationItem {
         position: position as u32,
         is_subscribed: false,
-        source: RecommendationSourceSummary {
-            id: candidate.row.source_id,
-            source_url: candidate.row.source_url,
-            resolved_source_url: candidate.row.resolved_source_url,
-            host: candidate.row.source_host,
-            title: candidate.row.source_title,
-            description: candidate.row.source_description,
-            source_kind: SourceKind::from_str(&candidate.row.source_kind)
-                .map_err(|_| ApiError::internal("Stored source kind was invalid"))?,
-            primary_feed_url: candidate.row.primary_feed_url,
-            refresh_status: RecommendationSourceRefreshStatus::from_db(
-                &candidate.row.refresh_status,
-            )?,
-            last_refreshed_at: maybe_timestamp_seconds(candidate.row.last_refreshed_at),
-        },
+        source,
+    })
+}
+
+fn build_public_source_recommendation_item(
+    position: usize,
+    candidate: ScoredSourceCandidate,
+) -> ApiResult<PublicSourceRecommendationItem> {
+    let source = build_recommendation_source_summary(candidate.row)?;
+
+    Ok(PublicSourceRecommendationItem {
+        position: position as u32,
+        source,
+    })
+}
+
+fn build_recommendation_source_summary(
+    row: RecommendationSourceCandidateRow,
+) -> ApiResult<RecommendationSourceSummary> {
+    Ok(RecommendationSourceSummary {
+        id: row.source_id,
+        source_url: row.source_url,
+        resolved_source_url: row.resolved_source_url,
+        host: row.source_host,
+        title: row.source_title,
+        description: row.source_description,
+        source_kind: SourceKind::from_str(&row.source_kind)
+            .map_err(|_| ApiError::internal("Stored source kind was invalid"))?,
+        primary_feed_url: row.primary_feed_url,
+        refresh_status: RecommendationSourceRefreshStatus::from_db(&row.refresh_status)?,
+        last_refreshed_at: maybe_timestamp_seconds(row.last_refreshed_at),
     })
 }
 
@@ -1155,6 +1344,15 @@ pub struct RecommendationPreferencesResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PublicSourceRecommendationsRequest {
+    #[serde(default)]
+    topic_slugs: Vec<String>,
+    #[serde(default)]
+    language_codes: Vec<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct InteractionEventBatchRequest {
     events: Vec<InteractionEventInput>,
 }
@@ -1193,6 +1391,11 @@ pub struct SourceRecommendationListResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PublicSourceRecommendationListResponse {
+    sources: Vec<PublicSourceRecommendationItem>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ContentRecommendationItem {
     position: u32,
     is_saved: bool,
@@ -1206,6 +1409,12 @@ pub struct ContentRecommendationItem {
 pub struct SourceRecommendationItem {
     position: u32,
     is_subscribed: bool,
+    source: RecommendationSourceSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicSourceRecommendationItem {
+    position: u32,
     source: RecommendationSourceSummary,
 }
 
@@ -1518,6 +1727,18 @@ struct RecommendationContentDetailRow {
 #[derive(Debug, FromRow)]
 struct TopicRow {
     id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedRecommendationPreferences {
+    pub(crate) language_codes: Vec<String>,
+    pub(crate) topic_ids: Vec<Uuid>,
+}
+
+impl ValidatedRecommendationPreferences {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.topic_ids.is_empty() && self.language_codes.is_empty()
+    }
 }
 
 #[derive(Debug, FromRow)]
