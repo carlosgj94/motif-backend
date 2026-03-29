@@ -48,6 +48,8 @@ Copy `.env.example` to `.env` and set:
 - `POST /auth/signup`: create an email/password auth user and store `username` in Supabase user metadata
 - `POST /auth/session`: sign in with email/password and receive a Supabase session payload
 - `POST /auth/session/refresh`: exchange a refresh token for a fresh session payload
+- `POST /me/password/reauthenticate`: ask Supabase Auth to send a password-change nonce to the authenticated user
+- `PUT /me/password`: change the authenticated user's password through Supabase Auth
 - `GET /recommendations/topics`: list onboarding topics before the user exists, including nested subtopics
 - `POST /recommendations/sources/preview`: get pre-auth source recommendations for onboarding topic or subtopic selections
 - `GET /me`: returns the verified Supabase user plus any claimed app profile
@@ -67,6 +69,17 @@ Copy `.env.example` to `.env` and set:
 9. Call `PUT /me/profile` once with the returned access token to claim the username in `public.profiles`.
 10. For Google and Apple, start OAuth with Supabase in the browser, then call `PUT /me/profile` if the user does not already have a profile row.
 11. Send `Authorization: Bearer <access_token>` on protected API calls.
+
+## Password change flow
+
+Use the authenticated API routes when a signed-in user wants to change their password:
+
+1. Call `PUT /me/password` with `new_password` when the current Supabase session is recent enough.
+2. If Supabase Auth requires reauthentication, call `POST /me/password/reauthenticate`.
+3. Collect the nonce delivered to the user's confirmed email or phone.
+4. Retry `PUT /me/password` with both `new_password` and `nonce`.
+
+Supabase handles the actual password policy enforcement and secure password change behavior. When secure password change is enabled, Supabase requires reauthentication for older sessions; according to the current Supabase docs, "recently signed in" means the session was created within the last 24 hours.
 
 ## Recommendation taxonomy
 

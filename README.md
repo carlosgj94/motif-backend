@@ -14,6 +14,8 @@ For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SET
 
 - `POST /auth/session` creates an email/password session.
 - All `/me/*` routes require `Authorization: Bearer <access_token>`.
+- `PUT /me/password` changes the signed-in user's password.
+- `POST /me/password/reauthenticate` triggers a Supabase password-change nonce when secure reauthentication is required.
 - Public response timestamps are Unix seconds.
 - Compact readable text is returned in `body.blocks`.
 - Favicons are fetched separately from `/me/content/{content_id}/favicon`.
@@ -46,6 +48,8 @@ Use this flow if you do not want the Supabase `service_role` key in the backend:
 
 - `GET /me`
 - `PUT /me/profile`
+- `PUT /me/password`
+- `POST /me/password/reauthenticate`
 
 ### Saved content
 
@@ -148,6 +152,29 @@ curl -sS -X POST "$API/auth/session/refresh" \
     "refresh_token": "'"$REFRESH_TOKEN"'"
   }' \
   | jq
+```
+
+### 4c. Request a password-change nonce
+
+Call this only when Supabase requires reauthentication for password changes. The nonce is delivered out-of-band to the user's confirmed email or phone.
+
+```bash
+curl -i -sS -X POST "$API/me/password/reauthenticate" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### 4d. Change the current password
+
+For recently created sessions, Supabase may allow this without a nonce. If secure password change is enabled and the session is older, include the nonce from the reauthentication step.
+
+```bash
+curl -i -sS -X PUT "$API/me/password" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "new_password": "your-new-password",
+    "nonce": "123456"
+  }'
 ```
 
 ### 5. Save onboarding preferences

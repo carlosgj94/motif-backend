@@ -110,6 +110,11 @@ async fn main() {
             get(recommendations::get_recommendation_preferences)
                 .put(recommendations::update_recommendation_preferences),
         )
+        .route("/me/password", put(auth_api::update_password))
+        .route(
+            "/me/password/reauthenticate",
+            post(auth_api::reauthenticate_password),
+        )
         .route(
             "/me/source-subscriptions",
             post(source_subscriptions::create_source_subscription)

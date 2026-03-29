@@ -3,14 +3,15 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION},
 };
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use reqwest::{Client, Method, Request, Response};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::{
     AppState,
+    auth::AuthenticatedSession,
     config::SupabaseConfig,
     error::{ApiError, ApiResult},
     profile::normalize_username,
@@ -46,18 +47,21 @@ impl SupabaseAuthApi {
         let email = normalize_email(&request.email)?;
         let password = normalize_password(&request.password)?;
         let username = normalize_username(&request.username)?;
-
-        self.send_auth_request(
-            self.client.post(format!("{}/signup", self.api_url)),
-            json!({
+        let request = self.build_public_auth_request(
+            Method::POST,
+            "signup",
+            Some(&json!({
                 "email": email,
                 "password": password,
                 "data": {
                     "username": username
                 }
-            }),
-        )
-        .await
+            })),
+        )?;
+
+        self.send_json_auth_request::<SupabaseAuthResponse>(request)
+            .await
+            .map(AuthFlowResponse::from)
     }
 
     pub async fn create_session(
@@ -66,16 +70,18 @@ impl SupabaseAuthApi {
     ) -> Result<AuthFlowResponse, ApiError> {
         let email = normalize_email(&request.email)?;
         let password = normalize_password(&request.password)?;
-
-        self.send_auth_request(
-            self.client
-                .post(format!("{}/token?grant_type=password", self.api_url)),
-            json!({
+        let request = self.build_public_auth_request(
+            Method::POST,
+            "token?grant_type=password",
+            Some(&json!({
                 "email": email,
                 "password": password,
-            }),
-        )
-        .await
+            })),
+        )?;
+
+        self.send_json_auth_request::<SupabaseAuthResponse>(request)
+            .await
+            .map(AuthFlowResponse::from)
     }
 
     pub async fn refresh_session(
@@ -83,67 +89,177 @@ impl SupabaseAuthApi {
         request: RefreshSessionRequest,
     ) -> Result<AuthFlowResponse, ApiError> {
         let refresh_token = normalize_refresh_token(&request.refresh_token)?;
-
-        self.send_auth_request(
-            self.client
-                .post(format!("{}/token?grant_type=refresh_token", self.api_url)),
-            json!({
+        let request = self.build_public_auth_request(
+            Method::POST,
+            "token?grant_type=refresh_token",
+            Some(&json!({
                 "refresh_token": refresh_token,
-            }),
-        )
-        .await
+            })),
+        )?;
+
+        self.send_json_auth_request::<SupabaseAuthResponse>(request)
+            .await
+            .map(AuthFlowResponse::from)
     }
 
-    async fn send_auth_request(
+    pub async fn reauthenticate(&self, access_token: &str) -> Result<(), ApiError> {
+        let request =
+            self.build_user_auth_request(Method::GET, "reauthenticate", access_token, None)?;
+
+        self.send_status_only_auth_request(request).await
+    }
+
+    pub async fn update_password(
         &self,
-        request: reqwest::RequestBuilder,
-        payload: Value,
-    ) -> Result<AuthFlowResponse, ApiError> {
-        let api_key = self.api_key.as_deref().ok_or_else(|| {
+        access_token: &str,
+        request: UpdatePasswordRequest,
+    ) -> Result<(), ApiError> {
+        let new_password = normalize_password(&request.new_password)?;
+        let nonce = normalize_optional_nonce(request.nonce.as_deref())?;
+        let mut payload = json!({
+            "password": new_password,
+        });
+
+        if let Some(nonce) = nonce {
+            payload["nonce"] = Value::String(nonce);
+        }
+
+        let request =
+            self.build_user_auth_request(Method::PUT, "user", access_token, Some(&payload))?;
+        self.send_status_only_auth_request(request).await
+    }
+
+    fn build_public_auth_request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&Value>,
+    ) -> Result<Request, ApiError> {
+        let api_key = self.publishable_key()?;
+        self.build_auth_request(method, path, api_key, payload)
+    }
+
+    fn build_user_auth_request(
+        &self,
+        method: Method,
+        path: &str,
+        access_token: &str,
+        payload: Option<&Value>,
+    ) -> Result<Request, ApiError> {
+        self.build_auth_request(method, path, access_token, payload)
+    }
+
+    fn build_auth_request(
+        &self,
+        method: Method,
+        path: &str,
+        bearer_token: &str,
+        payload: Option<&Value>,
+    ) -> Result<Request, ApiError> {
+        let api_key = self.publishable_key()?;
+        let headers = build_auth_headers(api_key, bearer_token)?;
+        let url = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
+        let request = self.client.request(method, url).headers(headers);
+        let request = if let Some(payload) = payload {
+            request.json(payload)
+        } else {
+            request
+        };
+
+        request
+            .build()
+            .map_err(|_| ApiError::internal("Supabase auth request could not be built"))
+    }
+
+    async fn send_request(&self, request: Request) -> Result<(StatusCode, Vec<u8>), ApiError> {
+        let response = self.client.execute(request).await.map_err(|error| {
+            tracing::error!(error = %error, "failed to call Supabase auth API");
+            ApiError::internal("Failed to reach Supabase auth API")
+        })?;
+
+        let status = response.status();
+        let body = read_response_body(response).await?;
+        Ok((status, body))
+    }
+
+    async fn send_json_auth_request<T: DeserializeOwned>(
+        &self,
+        request: Request,
+    ) -> Result<T, ApiError> {
+        let (status, body) = self.send_request(request).await?;
+        ensure_auth_success(status, &body)?;
+
+        serde_json::from_slice::<T>(&body).map_err(|error| {
+            tracing::error!(error = %error, "failed to decode Supabase auth success response");
+            ApiError::internal("Supabase auth response was invalid")
+        })
+    }
+
+    async fn send_status_only_auth_request(&self, request: Request) -> Result<(), ApiError> {
+        let (status, body) = self.send_request(request).await?;
+        ensure_auth_success(status, &body)
+    }
+
+    fn publishable_key(&self) -> Result<&str, ApiError> {
+        self.api_key.as_deref().ok_or_else(|| {
             ApiError::internal(
                 "SUPABASE_PUBLISHABLE_KEY or SUPABASE_ANON_KEY must be set to use auth endpoints",
             )
-        })?;
+        })
+    }
+}
 
-        let headers = build_auth_headers(api_key)?;
-
-        let response = request
-            .headers(headers)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, "failed to call Supabase auth API");
-                ApiError::internal("Failed to reach Supabase auth API")
-            })?;
-
-        let status = response.status();
-        let body = response.bytes().await.map_err(|error| {
+async fn read_response_body(response: Response) -> Result<Vec<u8>, ApiError> {
+    response
+        .bytes()
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|error| {
             tracing::error!(error = %error, "failed to read Supabase auth response body");
             ApiError::internal("Failed to read Supabase auth response")
-        })?;
+        })
+}
 
-        if !status.is_success() {
-            let provider_error = serde_json::from_slice::<SupabaseAuthError>(&body).ok();
-            let message = provider_error
-                .as_ref()
-                .and_then(SupabaseAuthError::message)
-                .unwrap_or("Supabase auth request failed");
-
-            return Err(ApiError::with_status(
-                map_upstream_status(status),
-                "auth_provider_error",
-                message,
-            ));
-        }
-
-        let upstream = serde_json::from_slice::<SupabaseAuthResponse>(&body).map_err(|error| {
-            tracing::error!(error = %error, "failed to decode Supabase auth success response");
-            ApiError::internal("Supabase auth response was invalid")
-        })?;
-
-        Ok(AuthFlowResponse::from(upstream))
+fn ensure_auth_success(status: StatusCode, body: &[u8]) -> Result<(), ApiError> {
+    if status.is_success() {
+        return Ok(());
     }
+
+    let provider_error = serde_json::from_slice::<SupabaseAuthError>(body).ok();
+    let message = provider_error
+        .as_ref()
+        .and_then(SupabaseAuthError::message)
+        .unwrap_or("Supabase auth request failed");
+
+    Err(ApiError::with_status(
+        map_upstream_status(status),
+        "auth_provider_error",
+        message,
+    ))
+}
+
+pub async fn reauthenticate_password(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    session: AuthenticatedSession,
+) -> ApiResult<StatusCode> {
+    enforce_password_reauthenticate_rate_limit(&state, remote_addr, session.user.user_id)?;
+    state.auth_api.reauthenticate(&session.access_token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn update_password(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    session: AuthenticatedSession,
+    Json(payload): Json<UpdatePasswordRequest>,
+) -> ApiResult<StatusCode> {
+    enforce_password_change_rate_limit(&state, remote_addr, session.user.user_id)?;
+    state
+        .auth_api
+        .update_password(&session.access_token, payload)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn sign_up(
@@ -183,14 +299,14 @@ pub async fn refresh_session(
     state.auth_api.refresh_session(payload).await.map(Json)
 }
 
-fn build_auth_headers(api_key: &str) -> Result<HeaderMap, ApiError> {
+fn build_auth_headers(api_key: &str, bearer_token: &str) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::new();
     let api_key_header = HeaderValue::from_str(api_key)
         .map_err(|_| ApiError::internal("Supabase publishable key is invalid"))?;
     headers.insert("apikey", api_key_header.clone());
 
-    let authorization_header = HeaderValue::from_str(&format!("Bearer {api_key}"))
-        .map_err(|_| ApiError::internal("Supabase publishable key is invalid"))?;
+    let authorization_header = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
+        .map_err(|_| ApiError::internal("Supabase authorization token is invalid"))?;
     headers.insert(AUTHORIZATION, authorization_header);
 
     Ok(headers)
@@ -214,6 +330,19 @@ fn normalize_password(input: &str) -> ApiResult<String> {
     }
 
     Ok(password)
+}
+
+fn normalize_optional_nonce(input: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+
+    let nonce = input.trim().to_string();
+    if nonce.is_empty() {
+        return Err(ApiError::bad_request("nonce must not be empty"));
+    }
+
+    Ok(Some(nonce))
 }
 
 fn normalize_refresh_token(input: &str) -> ApiResult<String> {
@@ -267,6 +396,26 @@ fn enforce_auth_refresh_rate_limit(
         .check_session_refresh(remote_addr.ip(), refresh_token)
 }
 
+fn enforce_password_reauthenticate_rate_limit(
+    state: &AppState,
+    remote_addr: SocketAddr,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    state
+        .auth_rate_limiter
+        .check_password_reauthenticate(remote_addr.ip(), &user_id.to_string())
+}
+
+fn enforce_password_change_rate_limit(
+    state: &AppState,
+    remote_addr: SocketAddr,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    state
+        .auth_rate_limiter
+        .check_password_change(remote_addr.ip(), &user_id.to_string())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignUpRequest {
     pub username: String,
@@ -283,6 +432,12 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Deserialize)]
 pub struct RefreshSessionRequest {
     pub refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePasswordRequest {
+    pub new_password: String,
+    pub nonce: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -389,55 +544,26 @@ impl SupabaseAuthError {
 #[cfg(test)]
 mod tests {
     use super::{
-        RefreshSessionRequest, SignUpRequest, SupabaseAuthApi, build_auth_headers, normalize_email,
-        normalize_password,
+        RefreshSessionRequest, SignUpRequest, SupabaseAuthApi, UpdatePasswordRequest,
+        build_auth_headers, normalize_email, normalize_optional_nonce, normalize_password,
     };
     use crate::{
-        AppState, auth::SupabaseAuth, config::SupabaseConfig, rate_limit::AuthRateLimiter,
+        AppState,
+        auth::{AuthenticatedSession, AuthenticatedUser, SupabaseAuth},
+        config::SupabaseConfig,
+        rate_limit::AuthRateLimiter,
     };
     use axum::{
-        Json, Router,
-        extract::{ConnectInfo, Query, State},
-        http::{HeaderMap, header::AUTHORIZATION},
+        Json,
+        extract::{ConnectInfo, State},
+        http::header::AUTHORIZATION,
         response::IntoResponse,
-        routing::post,
     };
-    use serde::Deserialize;
+    use reqwest::{Method, Request};
     use serde_json::{Value, json};
     use sqlx::postgres::PgPoolOptions;
-    use std::{
-        collections::HashMap,
-        net::SocketAddr,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
-    use tokio::sync::oneshot;
+    use std::{net::SocketAddr, time::Duration};
     use uuid::Uuid;
-
-    #[derive(Debug)]
-    struct CapturedRefreshRequest {
-        query: HashMap<String, String>,
-        auth_header: String,
-        api_key_header: String,
-        body: Value,
-    }
-
-    #[derive(Debug)]
-    struct CapturedSignUpRequest {
-        auth_header: String,
-        api_key_header: String,
-        body: Value,
-    }
-
-    #[derive(Clone)]
-    struct CaptureState {
-        sender: Arc<Mutex<Option<oneshot::Sender<CapturedRefreshRequest>>>>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct RefreshRequestBody {
-        refresh_token: String,
-    }
 
     fn test_supabase_config(url: String, publishable_key: &str) -> SupabaseConfig {
         SupabaseConfig {
@@ -464,97 +590,34 @@ mod tests {
         }
     }
 
-    async fn capture_refresh_request(
-        State(state): State<CaptureState>,
-        headers: HeaderMap,
-        Query(query): Query<HashMap<String, String>>,
-        Json(body): Json<RefreshRequestBody>,
-    ) -> impl IntoResponse {
-        let captured = CapturedRefreshRequest {
-            query,
-            auth_header: headers[AUTHORIZATION]
-                .to_str()
-                .expect("authorization header should be valid")
-                .to_string(),
-            api_key_header: headers["apikey"]
-                .to_str()
-                .expect("apikey header should be valid")
-                .to_string(),
-            body: json!({
-                "refresh_token": body.refresh_token,
-            }),
-        };
-
-        if let Some(sender) = state
-            .sender
-            .lock()
-            .expect("mutex should not be poisoned")
-            .take()
-        {
-            let _ = sender.send(captured);
-        }
-
-        Json(json!({
-            "access_token": "new-access-token",
-            "refresh_token": "new-refresh-token",
-            "token_type": "bearer",
-            "expires_in": 3600,
-            "expires_at": 1775000000,
-            "user": {
-                "id": Uuid::nil(),
-                "email": "user@example.com",
-                "role": "authenticated",
-                "email_confirmed_at": null,
-                "user_metadata": {},
-                "app_metadata": {}
-            }
-        }))
+    fn test_auth_api() -> SupabaseAuthApi {
+        let config =
+            test_supabase_config("http://127.0.0.1:9999".to_string(), "publishable-test-key");
+        SupabaseAuthApi::new(&config)
     }
 
-    async fn capture_sign_up_request(
-        State(state): State<CaptureState>,
-        headers: HeaderMap,
-        Json(body): Json<Value>,
-    ) -> impl IntoResponse {
-        let captured = CapturedSignUpRequest {
-            auth_header: headers[AUTHORIZATION]
-                .to_str()
-                .expect("authorization header should be valid")
-                .to_string(),
-            api_key_header: headers["apikey"]
-                .to_str()
-                .expect("apikey header should be valid")
-                .to_string(),
-            body,
-        };
-
-        if let Some(sender) = state
-            .sender
-            .lock()
-            .expect("mutex should not be poisoned")
-            .take()
-        {
-            let captured = CapturedRefreshRequest {
-                query: HashMap::new(),
-                auth_header: captured.auth_header,
-                api_key_header: captured.api_key_header,
-                body: captured.body,
-            };
-            let _ = sender.send(captured);
+    fn test_authenticated_session() -> AuthenticatedSession {
+        AuthenticatedSession {
+            access_token: "user-access-token".to_string(),
+            user: AuthenticatedUser {
+                user_id: Uuid::nil(),
+                email: Some("user@example.com".to_string()),
+                role: "authenticated".to_string(),
+                aal: Some("aal1".to_string()),
+                session_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+                app_metadata: Some(json!({})),
+                user_metadata: Some(json!({})),
+            },
         }
+    }
 
-        Json(json!({
-            "user": {
-                "id": Uuid::nil(),
-                "email": "user@example.com",
-                "role": "authenticated",
-                "email_confirmed_at": null,
-                "user_metadata": {
-                    "username": "reader01"
-                },
-                "app_metadata": {}
-            }
-        }))
+    fn request_json_body(request: &Request) -> Value {
+        let body = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("request body should be buffered");
+
+        serde_json::from_slice(body).expect("request body should decode as json")
     }
 
     #[test]
@@ -572,7 +635,7 @@ mod tests {
 
     #[test]
     fn builds_headers_with_api_key() {
-        let headers = build_auth_headers("test-key").expect("headers should build");
+        let headers = build_auth_headers("test-key", "test-key").expect("headers should build");
         assert_eq!(headers["apikey"], "test-key");
         assert_eq!(headers[AUTHORIZATION], "Bearer test-key");
     }
@@ -583,94 +646,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_session_uses_refresh_token_grant_type() {
-        let (sender, receiver) = oneshot::channel();
-        let capture_state = CaptureState {
-            sender: Arc::new(Mutex::new(Some(sender))),
-        };
-        let app = Router::new()
-            .route("/auth/v1/token", post(capture_refresh_request))
-            .with_state(capture_state);
+    async fn refresh_session_request_uses_refresh_token_grant_type() {
+        let auth_api = test_auth_api();
+        let request = auth_api
+            .build_public_auth_request(
+                Method::POST,
+                "token?grant_type=refresh_token",
+                Some(&json!({ "refresh_token": "refresh-token-123" })),
+            )
+            .expect("request should build");
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("listener should have local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("server should run");
-        });
-
-        let config = test_supabase_config(format!("http://{address}"), "publishable-test-key");
-        let auth_api = SupabaseAuthApi::new(&config);
-        let response = auth_api
-            .refresh_session(RefreshSessionRequest {
-                refresh_token: "refresh-token-123".to_string(),
-            })
-            .await
-            .expect("refresh should succeed");
-
-        let captured = receiver.await.expect("request should be captured");
-        server.abort();
-
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.url().path(), "/auth/v1/token");
+        assert_eq!(request.url().query(), Some("grant_type=refresh_token"));
+        assert_eq!(request.headers()["apikey"], "publishable-test-key");
         assert_eq!(
-            captured.query.get("grant_type").map(String::as_str),
-            Some("refresh_token")
+            request.headers()[AUTHORIZATION],
+            "Bearer publishable-test-key"
         );
-        assert_eq!(captured.auth_header, "Bearer publishable-test-key");
-        assert_eq!(captured.api_key_header, "publishable-test-key");
         assert_eq!(
-            captured.body,
+            request_json_body(&request),
             json!({ "refresh_token": "refresh-token-123" })
-        );
-        assert_eq!(
-            response
-                .session
-                .expect("session should be present")
-                .access_token,
-            "new-access-token"
         );
     }
 
-    #[tokio::test]
-    async fn sign_up_uses_only_auth_fields() {
-        let (sender, receiver) = oneshot::channel();
-        let capture_state = CaptureState {
-            sender: Arc::new(Mutex::new(Some(sender))),
-        };
-        let app = Router::new()
-            .route("/auth/v1/signup", post(capture_sign_up_request))
-            .with_state(capture_state);
+    #[test]
+    fn sign_up_request_uses_only_auth_fields() {
+        let auth_api = test_auth_api();
+        let request = auth_api
+            .build_public_auth_request(
+                Method::POST,
+                "signup",
+                Some(&json!({
+                    "email": "user@example.com",
+                    "password": "password123",
+                    "data": {
+                        "username": "reader01"
+                    }
+                })),
+            )
+            .expect("request should build");
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("listener should have local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("server should run");
-        });
-
-        let config = test_supabase_config(format!("http://{address}"), "publishable-test-key");
-        let auth_api = SupabaseAuthApi::new(&config);
-        let response = auth_api
-            .sign_up(SignUpRequest {
-                username: "reader01".to_string(),
-                email: "user@example.com".to_string(),
-                password: "password123".to_string(),
-            })
-            .await
-            .expect("sign up should succeed");
-
-        let captured = receiver.await.expect("request should be captured");
-        server.abort();
-
-        assert_eq!(captured.auth_header, "Bearer publishable-test-key");
-        assert_eq!(captured.api_key_header, "publishable-test-key");
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.url().path(), "/auth/v1/signup");
+        assert_eq!(request.headers()["apikey"], "publishable-test-key");
         assert_eq!(
-            captured.body,
+            request.headers()[AUTHORIZATION],
+            "Bearer publishable-test-key"
+        );
+        assert_eq!(
+            request_json_body(&request),
             json!({
                 "email": "user@example.com",
                 "password": "password123",
@@ -679,9 +704,47 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn reauthenticate_request_uses_user_access_token() {
+        let auth_api = test_auth_api();
+        let request = auth_api
+            .build_user_auth_request(Method::GET, "reauthenticate", "user-access-token", None)
+            .expect("request should build");
+
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.url().path(), "/auth/v1/reauthenticate");
+        assert_eq!(request.headers()["apikey"], "publishable-test-key");
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer user-access-token");
+        assert!(request.body().is_none());
+    }
+
+    #[test]
+    fn update_password_request_includes_nonce_when_present() {
+        let auth_api = test_auth_api();
+        let request = auth_api
+            .build_user_auth_request(
+                Method::PUT,
+                "user",
+                "user-access-token",
+                Some(&json!({
+                    "password": "new-password-123",
+                    "nonce": "123456",
+                })),
+            )
+            .expect("request should build");
+
+        assert_eq!(request.method(), Method::PUT);
+        assert_eq!(request.url().path(), "/auth/v1/user");
+        assert_eq!(request.headers()["apikey"], "publishable-test-key");
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer user-access-token");
         assert_eq!(
-            response.user.expect("user should be present").email,
-            Some("user@example.com".to_string())
+            request_json_body(&request),
+            json!({
+                "password": "new-password-123",
+                "nonce": "123456",
+            })
         );
     }
 
@@ -702,6 +765,11 @@ mod tests {
         assert_eq!(request.password, "password123");
     }
 
+    #[test]
+    fn rejects_empty_nonce() {
+        assert!(normalize_optional_nonce(Some("   ")).is_err());
+    }
+
     #[tokio::test]
     async fn refresh_session_handler_rejects_empty_refresh_token() {
         let state = test_app_state();
@@ -716,5 +784,101 @@ mod tests {
 
         let response = result.expect_err("refresh should fail").into_response();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_password_handler_rejects_short_passwords() {
+        let state = test_app_state();
+        let result = super::update_password(
+            State(state),
+            ConnectInfo("127.0.0.1:4000".parse::<SocketAddr>().unwrap()),
+            test_authenticated_session(),
+            Json(UpdatePasswordRequest {
+                new_password: "short".to_string(),
+                nonce: None,
+            }),
+        )
+        .await;
+
+        let response = result
+            .expect_err("password update should fail")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_password_handler_rejects_empty_nonce() {
+        let state = test_app_state();
+        let result = super::update_password(
+            State(state),
+            ConnectInfo("127.0.0.1:4000".parse::<SocketAddr>().unwrap()),
+            test_authenticated_session(),
+            Json(UpdatePasswordRequest {
+                new_password: "long-enough-password".to_string(),
+                nonce: Some("   ".to_string()),
+            }),
+        )
+        .await;
+
+        let response = result
+            .expect_err("password update should fail")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reauthenticate_password_handler_rate_limits_per_user() {
+        let state = test_app_state();
+        let remote_addr = "127.0.0.1:4000".parse::<SocketAddr>().unwrap();
+        let user_id = Uuid::nil();
+
+        for _ in 0..3 {
+            state
+                .auth_rate_limiter
+                .check_password_reauthenticate(remote_addr.ip(), &user_id.to_string())
+                .expect("attempt should pass");
+        }
+
+        let result = super::reauthenticate_password(
+            State(state),
+            ConnectInfo(remote_addr),
+            test_authenticated_session(),
+        )
+        .await;
+
+        let response = result
+            .expect_err("reauth should be rate limited")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn update_password_handler_rate_limits_per_user() {
+        let state = test_app_state();
+        let remote_addr = "127.0.0.1:4000".parse::<SocketAddr>().unwrap();
+        let user_id = Uuid::nil();
+
+        for _ in 0..10 {
+            state
+                .auth_rate_limiter
+                .check_password_change(remote_addr.ip(), &user_id.to_string())
+                .expect("attempt should pass");
+        }
+
+        let result = super::update_password(
+            State(state),
+            ConnectInfo(remote_addr),
+            test_authenticated_session(),
+            Json(UpdatePasswordRequest {
+                new_password: "long-enough-password".to_string(),
+                nonce: None,
+            }),
+        )
+        .await;
+
+        let response = result
+            .expect_err("password update should be rate limited")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 }

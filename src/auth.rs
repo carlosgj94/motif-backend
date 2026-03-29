@@ -195,6 +195,12 @@ impl AuthenticatedUser {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthenticatedSession {
+    pub access_token: String,
+    pub user: AuthenticatedUser,
+}
+
 impl FromRequestParts<AppState> for AuthenticatedUser {
     type Rejection = ApiError;
 
@@ -206,6 +212,24 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             .ok_or_else(|| ApiError::unauthorized("Missing bearer authorization header"))?;
 
         state.auth.verify_access_token(token).await
+    }
+}
+
+impl FromRequestParts<AppState> for AuthenticatedSession {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer_token(parts.headers.get(AUTHORIZATION))
+            .ok_or_else(|| ApiError::unauthorized("Missing bearer authorization header"))?;
+        let user = state.auth.verify_access_token(token).await?;
+
+        Ok(Self {
+            access_token: token.to_string(),
+            user,
+        })
     }
 }
 

@@ -38,6 +38,19 @@ impl AuthRateLimiter {
         self.check(AuthRoute::SessionRefresh, ip, refresh_token, Instant::now())
     }
 
+    pub fn check_password_reauthenticate(&self, ip: IpAddr, user_id: &str) -> ApiResult<()> {
+        self.check(
+            AuthRoute::PasswordReauthenticate,
+            ip,
+            user_id,
+            Instant::now(),
+        )
+    }
+
+    pub fn check_password_change(&self, ip: IpAddr, user_id: &str) -> ApiResult<()> {
+        self.check(AuthRoute::PasswordChange, ip, user_id, Instant::now())
+    }
+
     fn check(&self, route: AuthRoute, ip: IpAddr, email: &str, now: Instant) -> ApiResult<()> {
         let mut state = self
             .inner
@@ -82,6 +95,8 @@ enum AuthRoute {
     SignUp,
     Session,
     SessionRefresh,
+    PasswordReauthenticate,
+    PasswordChange,
 }
 
 impl AuthRoute {
@@ -98,6 +113,16 @@ impl AuthRoute {
                 window: SESSION_WINDOW,
             },
             Self::SessionRefresh => RateLimitRule {
+                ip_limit: SESSION_IP_LIMIT,
+                email_limit: SESSION_EMAIL_LIMIT,
+                window: SESSION_WINDOW,
+            },
+            Self::PasswordReauthenticate => RateLimitRule {
+                ip_limit: SIGN_UP_IP_LIMIT,
+                email_limit: SIGN_UP_EMAIL_LIMIT,
+                window: SIGN_UP_WINDOW,
+            },
+            Self::PasswordChange => RateLimitRule {
                 ip_limit: SESSION_IP_LIMIT,
                 email_limit: SESSION_EMAIL_LIMIT,
                 window: SESSION_WINDOW,
