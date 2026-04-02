@@ -7,7 +7,9 @@ import {
   collectFaviconCandidates,
   collectMetadata,
   discoverArticleSourceUrl,
+  extractArchiveSnapshot,
   extractFallbackArticleHtml,
+  extractOriginalUrlFromLinkHeader,
   extractThreadPosts,
   fetchDocument,
   isPublicIpLiteral,
@@ -163,6 +165,148 @@ Deno.test("collectMetadata reads meta tags and falls back to time datetime", () 
     coverImageUrl: "https://example.com/cover.png",
     siteName: "CRA",
   });
+});
+
+Deno.test("extractOriginalUrlFromLinkHeader reads the archive original relation", () => {
+  assertEquals(
+    extractOriginalUrlFromLinkHeader(
+      '<https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves>; rel="original", <http://archive.md/timegate/https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves>; rel="timegate"',
+    ),
+    "https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves",
+  );
+});
+
+Deno.test("extractArchiveSnapshot keeps the first archive.is article and removes related-content noise", () => {
+  const archiveUrl =
+    "https://archive.is/2026.03.27-142331/https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves";
+  const originalUrl =
+    "https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves";
+  const document = documentFromHtml(`
+    <html>
+      <head>
+        <title>AI Changed Chess, Grandmasters Now Win With Unpredictable Moves - Bloomberg</title>
+        <meta property="og:site_name" content="archive.is" />
+      </head>
+      <body>
+        <input type="text" name="q" value="${originalUrl}" />
+        <div id="that-jump-content--default"></div>
+        <main>
+          <article>
+            <div>Weekend Essay</div>
+            <div>
+              <header>
+                <h1>AI Perfected Chess. Humans Made It Unpredictable Again</h1>
+                <div>
+                  Artificial intelligence drove chess toward perfect play, leading to more draws at top tournaments.
+                  Now grandmasters are winning by making less optimal moves.
+                </div>
+              </header>
+            </div>
+            <div>
+              <figure>
+                <button type="button">
+                  <img
+                    currentSourceUrl="https://assets.bwbx.io/images/chess-hero.webp"
+                    src="/o69yu/chess-hero.webp"
+                    alt="Magnus Carlsen at the board"
+                  />
+                </button>
+                <figcaption>Illustration: Mathieu Labrecque for Bloomberg</figcaption>
+              </figure>
+            </div>
+            <div>
+              Gift this article
+              <div>Contact us: Provide news feedback or report an error</div>
+              <div>Confidential tip? Send a tip to our reporters</div>
+            </div>
+            <div>
+              <div>By <a rel="author" href="https://archive.is/o/o69yu/https://www.bloomberg.com/authors/AYLW4J3fKV4/kevin-lincoln">Kevin Lincoln</a></div>
+              <time datetime="2026-03-27T08:00:00Z">March 27, 2026 at 8:00 AM UTC</time>
+              <div>
+                At the biannual 2018 World Chess Championship, Magnus Carlsen defended his title against challenger
+                Fabiano Caruana in a best-of-12 format. Classical chess allows players long stretches of time in which
+                to make their moves, and the two logged more than 50 hours of play across 12 games. To the shock of
+                the chess world, every single game resulted in a draw, a first in the history of the championship.
+              </div>
+              <div>
+                This seemed to confirm a growing suspicion: Chess was dead and draws had killed it. But modern engines
+                also changed how players prepare, creating a strange situation where the strongest moves are often
+                understood best by computers while humans still have to navigate the practical game over the board.
+              </div>
+              <div>
+                <div>Get the Bloomberg Weekend newsletter.</div>
+                <div>Big ideas and open questions in the fascinating places where finance, life and culture meet.</div>
+                <form>
+                  <input type="email" name="email" placeholder="Enter your email" />
+                  <button type="submit">Sign Up</button>
+                </form>
+                <div>
+                  By continuing, I agree to the Privacy Policy and Terms of Service.
+                </div>
+              </div>
+              <div>
+                The next generation of grandmasters responded by searching for moves that were not strictly optimal but
+                were difficult for other humans to solve. That pushed elite chess back toward surprise, psychology and
+                practical pressure, making classical games more decisive again.
+              </div>
+              <button type="button">Copy Link</button>
+              <div>Follow all new stories by <b>Kevin Lincoln</b></div>
+              <button type="button">Get Alerts</button>
+            </div>
+            <div>
+              <h3>More From Bloomberg</h3>
+              <article>
+                <h1>Different Story Entirely</h1>
+                <div>Unrelated markets coverage should not leak into the parsed article.</div>
+              </article>
+            </div>
+          </article>
+        </main>
+      </body>
+    </html>
+  `);
+
+  const snapshot = extractArchiveSnapshot(document, archiveUrl, originalUrl);
+  assertObjectMatch(snapshot as unknown as { [key: string]: unknown }, {
+    sourceUrl: originalUrl,
+    sourceHost: "www.bloomberg.com",
+    siteName: "Bloomberg",
+    title: "AI Perfected Chess. Humans Made It Unpredictable Again",
+    description:
+      "Artificial intelligence drove chess toward perfect play, leading to more draws at top tournaments. Now grandmasters are winning by making less optimal moves.",
+    author: "Kevin Lincoln",
+    publishedAt: "2026-03-27T08:00:00.000Z",
+    coverImageUrl: "https://assets.bwbx.io/images/chess-hero.webp",
+  });
+
+  if (!snapshot.articleHtml) {
+    throw new Error("expected archive article html");
+  }
+
+  assertEquals(snapshot.articleHtml.includes("More From Bloomberg"), false);
+  assertEquals(snapshot.articleHtml.includes("Bloomberg Weekend newsletter"), false);
+  assertEquals(snapshot.articleHtml.includes("Privacy Policy"), false);
+  assertEquals(snapshot.articleHtml.includes("Follow all new stories"), false);
+  assertEquals(snapshot.articleHtml.includes("Get Alerts"), false);
+  assertEquals(snapshot.articleHtml.includes("At the biannual 2018 World Chess Championship"), true);
+
+  const blocks = buildArticleBlocks(snapshot.articleHtml, archiveUrl);
+  assertEquals(
+    (blocks[0] as { type: string; text: string }).type,
+    "paragraph",
+  );
+  assertEquals(
+    (blocks[0] as { type: string; text: string }).text.includes(
+      "At the biannual 2018 World Chess Championship",
+    ),
+    true,
+  );
+  assertEquals(
+    blocks.some((block) =>
+      "text" in block && String(block.text).includes("Different Story Entirely")
+    ),
+    false,
+  );
 });
 
 Deno.test("discoverArticleSourceUrl prefers rel=home candidates", () => {
@@ -450,6 +594,49 @@ Deno.test("fetchDocument rejects oversized HTML bodies before parsing", async ()
       }),
     "exceeded the size limit",
   );
+});
+
+Deno.test("fetchDocument falls back to another archive mirror after a 429", async () => {
+  const archiveUrl =
+    "https://archive.is/2026.03.27-142331/https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves";
+  const mirrorUrl =
+    "https://archive.ph/2026.03.27-142331/https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves";
+  const fetchCalls: string[] = [];
+
+  const result = await fetchDocument(archiveUrl, {
+    resolveDns: async () => ["93.184.216.34"],
+    fetchImpl: async (input) => {
+      const url = String(input);
+      fetchCalls.push(url);
+
+      if (url === archiveUrl) {
+        return new Response("rate limited", {
+          status: 429,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+
+      if (url === mirrorUrl) {
+        return new Response("<html><body><article><p>Mirror fetch worked.</p></article></body></html>", {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            link: "<https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves>; rel=\"original\"",
+          },
+        });
+      }
+
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+
+  assertEquals(fetchCalls, [archiveUrl, mirrorUrl]);
+  assertObjectMatch(result as unknown as { [key: string]: unknown }, {
+    resolvedUrl: mirrorUrl,
+    host: "archive.ph",
+    originalUrl:
+      "https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves",
+  });
 });
 
 Deno.test("sanitizeParsedBlocks clamps oversized content", () => {

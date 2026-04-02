@@ -35,6 +35,18 @@ const MAX_THREAD_HANDLE_CHARS = 64;
 const MAX_THREAD_DISPLAY_NAME_CHARS = 128;
 const RETRY_DELAYS_SECONDS = [60, 300, 1800];
 const TRUSTED_FETCH_HOSTS = new Set(["publish.twitter.com"]);
+const ARCHIVE_MIRROR_HOSTS = [
+  "archive.ph",
+  "archive.md",
+  "archive.today",
+  "archive.is",
+  "archive.fo",
+  "archive.li",
+  "archive.vn",
+] as const;
+const ARCHIVE_HOSTS: ReadonlySet<string> = new Set<string>(
+  ARCHIVE_MIRROR_HOSTS,
+);
 const NON_DISCOVERABLE_SOURCE_HOSTS = new Set([
   "x.com",
   "twitter.com",
@@ -168,6 +180,18 @@ interface PartialContentUpdate {
   last_successful_fetch_at?: string | null;
 }
 
+interface ArchiveSnapshot {
+  sourceUrl: string | null;
+  sourceHost: string | null;
+  siteName: string | null;
+  title: string | null;
+  description: string | null;
+  author: string | null;
+  publishedAt: string | null;
+  coverImageUrl: string | null;
+  articleHtml: string | null;
+}
+
 interface BatchResult {
   dequeued: number;
   processed: number;
@@ -183,6 +207,7 @@ interface FetchDocumentResult {
   html: string;
   status: number;
   fetchedAt: string;
+  originalUrl: string | null;
 }
 
 type DnsRecordType = "A" | "AAAA";
@@ -427,6 +452,9 @@ async function processClaimedContent(
   if (isXHost(fetched.host)) {
     return processXDocument(fetched);
   }
+  if (isArchiveHost(fetched.host)) {
+    return processArchiveDocument(fetched);
+  }
 
   return processArticleDocument(fetched);
 }
@@ -435,14 +463,92 @@ export async function fetchDocument(
   url: string,
   policy: NetworkPolicy = {},
 ): Promise<FetchDocumentResult> {
-  const { response, resolvedUrl } = await performValidatedFetch(url, {
-    policy,
-    accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    maxRedirects,
-  });
+  const archiveCandidates = buildArchiveMirrorCandidates(url);
+  let lastArchiveResponse:
+    | { response: Response; resolvedUrl: string }
+    | null = null;
+  let lastArchiveFailure: ProcessingFailure | null = null;
 
-  if (!response.ok) {
+  for (let index = 0; index < archiveCandidates.length; index += 1) {
+    const candidateUrl = archiveCandidates[index];
+    const hasFallbackCandidate = index < archiveCandidates.length - 1;
+
+    try {
+      const { response, resolvedUrl } = await performValidatedFetch(candidateUrl, {
+        policy,
+        accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        maxRedirects,
+      });
+
+      if (
+        hasFallbackCandidate &&
+        response.status === 429 &&
+        isArchiveHost(safeHost(resolvedUrl) ?? "")
+      ) {
+        lastArchiveResponse = { response, resolvedUrl };
+        await response.body?.cancel().catch(() => undefined);
+        continue;
+      }
+
+      if (!response.ok) {
+        throw ProcessingFailure.fetch(
+          `Source URL returned HTTP ${response.status}`,
+          {
+            httpStatus: response.status,
+            retryable: response.status === 429 || response.status >= 500,
+          },
+        );
+      }
+
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!contentType.includes("html")) {
+        throw ProcessingFailure.fetch("Source URL did not return HTML content", {
+          httpStatus: response.status,
+          retryable: false,
+        });
+      }
+
+      const html = await readResponseText(
+        response,
+        maxHtmlBytes,
+        "Source HTML body",
+      );
+      const resolvedHost = safeHost(resolvedUrl);
+      if (!resolvedHost) {
+        throw ProcessingFailure.fetch("Resolved URL host was invalid", {
+          httpStatus: response.status,
+          retryable: false,
+        });
+      }
+
+      return {
+        resolvedUrl,
+        host: resolvedHost,
+        html,
+        status: response.status,
+        fetchedAt: new Date().toISOString(),
+        originalUrl: isArchiveHost(resolvedHost)
+          ? extractOriginalUrlFromLinkHeader(response.headers.get("link"))
+          : null,
+      };
+    } catch (error) {
+      if (
+        hasFallbackCandidate &&
+        error instanceof ProcessingFailure &&
+        error.stage === "fetch" &&
+        error.retryable
+      ) {
+        lastArchiveFailure = error;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  if (lastArchiveResponse) {
+    const { response } = lastArchiveResponse;
     throw ProcessingFailure.fetch(
       `Source URL returned HTTP ${response.status}`,
       {
@@ -451,35 +557,13 @@ export async function fetchDocument(
       },
     );
   }
-
-  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-  if (!contentType.includes("html")) {
-    throw ProcessingFailure.fetch("Source URL did not return HTML content", {
-      httpStatus: response.status,
-      retryable: false,
-    });
+  if (lastArchiveFailure) {
+    throw lastArchiveFailure;
   }
 
-  const html = await readResponseText(
-    response,
-    maxHtmlBytes,
-    "Source HTML body",
-  );
-  const resolvedHost = safeHost(resolvedUrl);
-  if (!resolvedHost) {
-    throw ProcessingFailure.fetch("Resolved URL host was invalid", {
-      httpStatus: response.status,
-      retryable: false,
-    });
-  }
-
-  return {
-    resolvedUrl,
-    host: resolvedHost,
-    html,
-    status: response.status,
-    fetchedAt: new Date().toISOString(),
-  };
+  throw ProcessingFailure.fetch("Request to source URL failed", {
+    retryable: true,
+  });
 }
 
 export async function performValidatedFetch(
@@ -743,6 +827,129 @@ async function processArticleDocument(
     sourceDiscoveryUrl: discoverArticleSourceUrl(
       sourceDocument,
       fetched.resolvedUrl,
+    ),
+  };
+}
+
+async function processArchiveDocument(
+  fetched: FetchDocumentResult,
+): Promise<ProcessedContent> {
+  const sourceDocument = parseDocument(fetched.html);
+  const metadata = collectMetadata(sourceDocument);
+  const snapshot = extractArchiveSnapshot(
+    sourceDocument,
+    fetched.resolvedUrl,
+    fetched.originalUrl,
+  );
+  const favicon = await fetchFavicon(
+    sourceDocument,
+    snapshot.sourceUrl ?? fetched.resolvedUrl,
+  );
+
+  let blocks = buildArticleBlocks(
+    snapshot.articleHtml ?? "",
+    fetched.resolvedUrl,
+  );
+  if (blocks.length === 0) {
+    blocks = buildArticleBlocks(
+      extractFallbackArticleHtml(sourceDocument),
+      fetched.resolvedUrl,
+    );
+  }
+
+  const title = trimText(
+    snapshot.title ?? metadata.title ?? null,
+    MAX_TITLE_CHARS,
+  );
+  const author = trimText(
+    snapshot.author ?? metadata.author ?? null,
+    MAX_AUTHOR_CHARS,
+  );
+  const publishedAt = snapshot.publishedAt ?? metadata.publishedAt;
+  const excerpt = trimText(
+    snapshot.description ?? metadata.description ?? summarizeBlocks(blocks),
+    MAX_EXCERPT_CHARS,
+  );
+  const siteName = trimText(
+    snapshot.siteName ?? metadata.siteName ?? snapshot.sourceHost ??
+      fetched.host,
+    MAX_SITE_NAME_CHARS,
+  );
+  const languageCode = trimText(metadata.languageCode, MAX_LANGUAGE_CODE_CHARS);
+  const coverImageUrl = trimUrl(
+    snapshot.coverImageUrl ?? metadata.coverImageUrl,
+  );
+  const baseUpdate = buildBaseUpdate({
+    fetched,
+    metadata,
+    favicon,
+    sourceKind: "article",
+    siteName,
+    title,
+    excerpt,
+    author,
+    publishedAt,
+    languageCode,
+    coverImageUrl,
+  });
+
+  if (blocks.length === 0) {
+    throw ProcessingFailure.parse("Readable article body was empty", {
+      httpStatus: fetched.status,
+      retryable: false,
+      partialUpdate: baseUpdate,
+    });
+  }
+
+  blocks = sanitizeParsedBlocks(blocks);
+  if (blocks.length === 0) {
+    throw ProcessingFailure.parse(
+      "Readable article body was empty after normalization",
+      {
+        httpStatus: fetched.status,
+        retryable: false,
+        partialUpdate: baseUpdate,
+      },
+    );
+  }
+
+  const parsedDocument = enforceParsedDocumentSizeLimit({
+    version: 1,
+    kind: "article",
+    title,
+    byline: author,
+    published_at: publishedAt,
+    language_code: languageCode,
+    blocks,
+  }, baseUpdate);
+  const metrics = deriveParsedDocumentMetrics(parsedDocument);
+  const discoveryUrl = snapshot.sourceUrl ?? fetched.resolvedUrl;
+  const discoveryDocument = snapshot.articleHtml
+    ? parseDocument(`<html><body>${snapshot.articleHtml}</body></html>`)
+    : sourceDocument;
+
+  return {
+    resolvedUrl: fetched.resolvedUrl,
+    host: snapshot.sourceHost ?? fetched.host,
+    siteName,
+    sourceKind: "article",
+    title,
+    excerpt,
+    author,
+    publishedAt,
+    languageCode,
+    coverImageUrl,
+    favicon,
+    parsedDocument,
+    wordCount: metrics.wordCount,
+    estimatedReadSeconds: metrics.estimatedReadSeconds,
+    blockCount: metrics.blockCount,
+    imageCount: metrics.imageCount,
+    httpStatus: fetched.status,
+    fetchedAt: fetched.fetchedAt,
+    sourceDiscoveryUrl: discoverArticleSourceUrl(
+      discoveryDocument,
+      discoveryUrl,
     ),
   };
 }
@@ -1621,6 +1828,346 @@ export function collectMetadata(document: Document) {
   };
 }
 
+export function extractArchiveSnapshot(
+  document: Document,
+  resolvedUrl: string,
+  sourceUrlHint: string | null = null,
+): ArchiveSnapshot {
+  const sourceUrl = firstNonEmpty(
+    normalizeArchiveSourceUrl(resolvedUrl, sourceUrlHint),
+    normalizeArchiveSourceUrl(
+      resolvedUrl,
+      extractArchiveSourceUrlFromDocument(document),
+    ),
+  );
+  const sourceHost = sourceUrl ? safeHost(sourceUrl) : null;
+  const article = selectArchivePrimaryArticle(document);
+  const title = firstNonEmpty(
+    collapseWhitespace(article?.querySelector("h1")?.textContent ?? "") || null,
+    collapseWhitespace(document.querySelector("title")?.textContent ?? "") ||
+      null,
+  );
+
+  return {
+    sourceUrl,
+    sourceHost,
+    siteName: firstNonEmpty(
+      extractSiteNameFromTitle(
+        collapseWhitespace(document.querySelector("title")?.textContent ?? "") ||
+          null,
+      ),
+      sourceHost?.replace(/^www\./, "") ?? null,
+    ),
+    title,
+    description: article ? extractArchiveHeaderDescription(article, title) : null,
+    author: firstNonEmpty(
+      collapseWhitespace(
+        article?.querySelector("[rel='author']")?.textContent ?? "",
+      ) || null,
+    ),
+    publishedAt: parseIsoDate(
+      article?.querySelector("time[datetime]")?.getAttribute("datetime") ??
+        null,
+    ),
+    coverImageUrl: article ? extractArchiveCoverImageUrl(article, resolvedUrl) : null,
+    articleHtml: article ? extractArchiveArticleHtml(article) : null,
+  };
+}
+
+function extractArchiveSourceUrlFromDocument(document: Document): string | null {
+  const input = document.querySelector(
+    "input[name='q'][value]",
+  ) as Element | null;
+  return input?.getAttribute("value")?.trim() ?? null;
+}
+
+function normalizeArchiveSourceUrl(
+  baseUrl: string,
+  candidate: string | null | undefined,
+): string | null {
+  const resolved = resolveUrl(baseUrl, candidate);
+  if (!resolved) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(resolved);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    if (parsed.username || parsed.password) {
+      return null;
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function selectArchivePrimaryArticle(document: Document): Element | null {
+  const jumpTarget = document.querySelector("#that-jump-content--default");
+  const scopedMain = jumpTarget?.parentElement?.querySelector("main");
+  const candidates = Array.from(
+    (scopedMain ?? document).querySelectorAll("article"),
+  ) as Element[];
+
+  for (const candidate of candidates) {
+    const title = collapseWhitespace(
+      candidate.querySelector("h1")?.textContent ?? "",
+    );
+    const textLength = collapseWhitespace(candidate.textContent ?? "").length;
+    if (
+      title &&
+      !/^(more from|up next)\b/i.test(title) &&
+      textLength >= 500 &&
+      (
+        candidate.querySelector("[rel='author']") ||
+        candidate.querySelector("time[datetime]")
+      )
+    ) {
+      return candidate;
+    }
+  }
+
+  return candidates
+    .filter((candidate) =>
+      collapseWhitespace(candidate.querySelector("h1")?.textContent ?? "").length >
+        0
+    )
+    .sort((left, right) =>
+      collapseWhitespace(right.textContent ?? "").length -
+      collapseWhitespace(left.textContent ?? "").length
+    )[0] ?? null;
+}
+
+function extractArchiveArticleHtml(article: Element): string | null {
+  const children = Array.from(article.children) as Element[];
+  const headerIndex = children.findIndex((child) => child.querySelector("h1"));
+  const bodyIndex = children.findIndex((child) =>
+    child.querySelector("[rel='author']") ||
+    child.querySelector("time[datetime]") ||
+    looksLikeArchiveBodyChild(child)
+  );
+
+  const selected: string[] = [];
+  if (headerIndex >= 0) {
+    selected.push(children[headerIndex].outerHTML);
+  }
+
+  const start = headerIndex >= 0 ? headerIndex + 1 : 0;
+  const end = bodyIndex >= 0 ? bodyIndex : children.length;
+  for (let index = start; index < end; index += 1) {
+    const child = children[index];
+    if (child.querySelector("img, picture, figure, video")) {
+      selected.push(child.outerHTML);
+    }
+  }
+
+  if (bodyIndex >= 0) {
+    const bodyClone = children[bodyIndex].cloneNode(true) as Element;
+    sanitizeArchiveBody(bodyClone);
+    if (collapseWhitespace(bodyClone.textContent ?? "") || bodyClone.querySelector("img")) {
+      selected.push(bodyClone.outerHTML);
+    }
+  }
+
+  const fragment = selected.join("");
+  if (!fragment) {
+    return null;
+  }
+
+  const readable = new Readability(
+    parseDocument(`<html><body>${fragment}</body></html>`),
+  ).parse();
+  return readable?.content ?? fragment;
+}
+
+function looksLikeArchiveBodyChild(element: Element): boolean {
+  const textLength = collapseWhitespace(element.textContent ?? "").length;
+  return textLength >= 1200 ||
+    (textLength >= 400 && !!element.querySelector("img, figure")) ||
+    element.querySelectorAll("p").length >= 2;
+}
+
+function sanitizeArchiveBody(root: Element): void {
+  for (
+    const element of Array.from(root.querySelectorAll("*")) as Element[]
+  ) {
+    if (looksLikeArchiveMetadataRow(element)) {
+      element.remove();
+      continue;
+    }
+
+    if (looksLikeArchiveSignupModule(element)) {
+      element.remove();
+      continue;
+    }
+
+    if (isArchivePromotionalText(element)) {
+      element.remove();
+      continue;
+    }
+
+    const tagName = element.tagName.toLowerCase();
+    if (tagName === "button") {
+      if (element.querySelector("img, picture, figure, video, source")) {
+        unwrapElement(element);
+      } else {
+        element.remove();
+      }
+      continue;
+    }
+
+    if (
+      tagName === "form" ||
+      tagName === "input" ||
+      tagName === "label" ||
+      tagName === "option"
+    ) {
+      element.remove();
+      continue;
+    }
+
+    const style = (element.getAttribute("style") ?? "").toLowerCase();
+    if (style.includes("display:none") || style.includes("visibility:hidden")) {
+      element.remove();
+    }
+  }
+}
+
+function looksLikeArchiveMetadataRow(element: Element): boolean {
+  const text = collapseWhitespace(element.textContent ?? "");
+  if (!text) {
+    return false;
+  }
+
+  const hasRichContent = !!element.querySelector(
+    "p, figure, img, video, article, form, blockquote, ul, ol",
+  );
+  if (hasRichContent) {
+    return false;
+  }
+
+  if (element.querySelector("[rel='author']")) {
+    return true;
+  }
+
+  if (element.matches("time[datetime]")) {
+    return text.length <= 80;
+  }
+
+  return !!element.querySelector("time[datetime]") && text.length <= 80;
+}
+
+function looksLikeArchiveSignupModule(element: Element): boolean {
+  const text = collapseWhitespace(element.textContent ?? "");
+  if (!text) {
+    return false;
+  }
+
+  const hasSignupControls = !!element.querySelector(
+    "form, input[type='email'], button[type='submit']",
+  );
+  if (!hasSignupControls) {
+    return false;
+  }
+
+  return /\b(newsletter|sign up|subscribe|enter your email)\b/i.test(text) ||
+    /\b(privacy policy|terms of service)\b/i.test(text);
+}
+
+function unwrapElement(element: Element): void {
+  const parent = element.parentNode;
+  if (!parent) {
+    return;
+  }
+
+  while (element.firstChild) {
+    parent.insertBefore(element.firstChild, element);
+  }
+  element.remove();
+}
+
+function isArchivePromotionalText(element: Element): boolean {
+  const text = collapseWhitespace(element.textContent ?? "");
+  if (!text) {
+    return false;
+  }
+
+  return /^follow all new stories by\b/i.test(text) ||
+    /^(following|get alerts|sign up)\b/i.test(text) ||
+    /^up next\b/i.test(text) ||
+    /^more from bloomberg\b/i.test(text) ||
+    /^contact us:/i.test(text) ||
+    /^confidential tip\?/i.test(text) ||
+    /^site feedback:/i.test(text) ||
+    /^gift this article\b/i.test(text);
+}
+
+function extractArchiveHeaderDescription(
+  article: Element,
+  title: string | null,
+): string | null {
+  const header = article.querySelector("header") as Element | null;
+  if (!header) {
+    return null;
+  }
+
+  for (
+    const candidate of Array.from(header.querySelectorAll("p, div")) as Element[]
+  ) {
+    if (candidate.querySelector("h1, h2, h3, h4, h5, h6")) {
+      continue;
+    }
+
+    const text = collapseWhitespace(candidate.textContent ?? "");
+    if (!text || text === title || text.length < 40) {
+      continue;
+    }
+
+    return text;
+  }
+
+  return null;
+}
+
+function extractArchiveCoverImageUrl(
+  article: Element,
+  baseUrl: string,
+): string | null {
+  const image = article.querySelector("img") as Element | null;
+  return image ? extractImageUrl(image, baseUrl) : null;
+}
+
+function extractSiteNameFromTitle(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const parts = value
+    .split(/\s[-|–—]\s/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length < 2) {
+    return null;
+  }
+
+  const candidate = parts[parts.length - 1];
+  return candidate.length <= 64 ? candidate : null;
+}
+
+export function extractOriginalUrlFromLinkHeader(
+  value: string | null,
+): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = value.match(/<([^>]+)>\s*;\s*rel="original"/i);
+  return match?.[1] ?? null;
+}
+
 export function discoverArticleSourceUrl(
   document: Document,
   articleUrl: string,
@@ -2168,6 +2715,15 @@ function extractCodeBlock(element: Element): ParsedBlock | null {
 }
 
 function extractImageUrl(element: Element, baseUrl: string): string | null {
+  const directUrl = resolveUrl(
+    baseUrl,
+    element.getAttribute("currentSourceUrl") ??
+      element.getAttribute("data-current-src"),
+  );
+  if (directUrl) {
+    return directUrl;
+  }
+
   const srcset = element.getAttribute("srcset") ??
     element.getAttribute("data-srcset");
   if (srcset) {
@@ -2872,6 +3428,36 @@ function safeHost(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+function isArchiveHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/^www\./, "");
+  return ARCHIVE_HOSTS.has(normalized);
+}
+
+function buildArchiveMirrorCandidates(url: string): string[] {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return [url];
+  }
+
+  const normalizedHost = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  if (!isArchiveHost(normalizedHost)) {
+    return [url];
+  }
+
+  return [
+    url,
+    ...ARCHIVE_MIRROR_HOSTS
+      .filter((host) => host !== normalizedHost)
+      .map((host) => {
+        const nextUrl = new URL(parsed.toString());
+        nextUrl.hostname = host;
+        return nextUrl.toString();
+      }),
+  ];
 }
 
 function isXHost(host: string): boolean {
