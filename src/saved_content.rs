@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Transaction, types::Json as SqlxJson};
 use time::OffsetDateTime;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
@@ -33,6 +35,8 @@ use crate::{
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 100;
+const PROCESSING_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const PROCESSING_WAIT_INTERVAL: Duration = Duration::from_millis(150);
 
 pub async fn save_saved_content(
     user: AuthenticatedUser,
@@ -101,9 +105,14 @@ pub async fn save_saved_content(
 
     attempt_source_discovery_for_saved_content(&state.pool, &normalized_url, content.id).await;
 
-    let summary = fetch_saved_content_summary(&state.pool, user.user_id, saved_content_id)
-        .await?
-        .ok_or_else(|| ApiError::internal("Saved content disappeared after save"))?;
+    let summary = wait_for_saved_content_summary(
+        &state.pool,
+        user.user_id,
+        saved_content_id,
+        should_enqueue_processing,
+    )
+    .await?
+    .ok_or_else(|| ApiError::internal("Saved content disappeared after save"))?;
 
     let status = if existing_id.is_some() {
         StatusCode::OK
@@ -704,6 +713,26 @@ async fn fetch_saved_content_summary(
     Ok(Some(build_saved_content_summary(row, tags)?))
 }
 
+async fn wait_for_saved_content_summary(
+    pool: &PgPool,
+    user_id: Uuid,
+    saved_content_id: Uuid,
+    wait_for_processing: bool,
+) -> ApiResult<Option<SavedContentSummary>> {
+    let mut summary = fetch_saved_content_summary(pool, user_id, saved_content_id).await?;
+    if !wait_for_processing {
+        return Ok(summary);
+    }
+
+    let deadline = Instant::now() + PROCESSING_WAIT_TIMEOUT;
+    while should_keep_waiting_for_processing(summary.as_ref()) && Instant::now() < deadline {
+        sleep(PROCESSING_WAIT_INTERVAL).await;
+        summary = fetch_saved_content_summary(pool, user_id, saved_content_id).await?;
+    }
+
+    Ok(summary)
+}
+
 async fn fetch_saved_content_summary_row(
     pool: &PgPool,
     user_id: Uuid,
@@ -1176,6 +1205,16 @@ fn should_enqueue_content_processing(content: &ContentProcessingStateRow) -> boo
         )
 }
 
+fn should_keep_waiting_for_processing(summary: Option<&SavedContentSummary>) -> bool {
+    matches!(
+        summary.map(|value| (value.content.fetch_status, value.content.parse_status)),
+        Some((ProcessingStatus::Pending, _))
+            | Some((ProcessingStatus::InProgress, _))
+            | Some((_, ProcessingStatus::Pending))
+            | Some((_, ProcessingStatus::InProgress))
+    )
+}
+
 fn normalize_page_size(limit: Option<u32>) -> ApiResult<u32> {
     let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
@@ -1513,7 +1552,7 @@ mod tests {
         ContentDetail, ContentProcessingStateRow, ContentSummary, SavedContentDetail,
         SavedContentSummary, SavedContentSummaryRow, TagSummary, decode_cursor, encode_cursor,
         humanize_tag_slug, normalize_page_size, normalize_requested_tag_slugs,
-        should_enqueue_content_processing,
+        should_enqueue_content_processing, should_keep_waiting_for_processing,
     };
     use crate::content::{ProcessingStatus, ReadState, SourceKind, TagScope};
     use crate::embedded_content::{
@@ -1602,6 +1641,75 @@ mod tests {
                 has_parsed_document: true,
             }
         ));
+    }
+
+    #[test]
+    fn keeps_waiting_while_summary_is_still_processing() {
+        let summary = SavedContentSummary {
+            id: Uuid::nil(),
+            submitted_url: "https://example.com".to_string(),
+            read_state: ReadState::Unread,
+            is_favorited: false,
+            archived_at: None,
+            created_at: 0,
+            updated_at: 0,
+            tags: Vec::new(),
+            content: ContentSummary {
+                id: Uuid::nil(),
+                canonical_url: "https://example.com".to_string(),
+                resolved_url: None,
+                host: "example.com".to_string(),
+                site_name: None,
+                source_kind: None,
+                title: None,
+                excerpt: None,
+                author: None,
+                published_at: None,
+                language_code: None,
+                has_favicon: false,
+                favicon_href: None,
+                fetch_status: ProcessingStatus::InProgress,
+                parse_status: ProcessingStatus::Pending,
+                parsed_at: None,
+            },
+        };
+
+        assert!(should_keep_waiting_for_processing(Some(&summary)));
+    }
+
+    #[test]
+    fn stops_waiting_once_processing_finishes() {
+        let summary = SavedContentSummary {
+            id: Uuid::nil(),
+            submitted_url: "https://example.com".to_string(),
+            read_state: ReadState::Unread,
+            is_favorited: false,
+            archived_at: None,
+            created_at: 0,
+            updated_at: 0,
+            tags: Vec::new(),
+            content: ContentSummary {
+                id: Uuid::nil(),
+                canonical_url: "https://example.com".to_string(),
+                resolved_url: None,
+                host: "example.com".to_string(),
+                site_name: None,
+                source_kind: None,
+                title: Some("Example".to_string()),
+                excerpt: None,
+                author: None,
+                published_at: None,
+                language_code: None,
+                has_favicon: false,
+                favicon_href: None,
+                fetch_status: ProcessingStatus::Succeeded,
+                parse_status: ProcessingStatus::Succeeded,
+                parsed_at: Some(1),
+            },
+        };
+
+        assert!(!should_keep_waiting_for_processing(Some(&summary)));
+        assert!(!should_keep_waiting_for_processing(None));
     }
 
     #[test]

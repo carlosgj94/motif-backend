@@ -153,6 +153,7 @@ Optional source refresh tuning secrets:
 The database helper `public.invoke_content_processor(...)` reads these secrets from Supabase Vault:
 
 - `project_url`
+- `anon_key` preferred, or `service_role_key` only as a fallback for the `Authorization` bearer token
 - `publishable_key`
 - `content_processor_secret`
 
@@ -160,13 +161,22 @@ Create them in SQL with values from your project:
 
 ```sql
 select vault.create_secret('https://<project-ref>.supabase.co', 'project_url');
+select vault.create_secret('<your-anon-key>', 'anon_key');
 select vault.create_secret('<your-publishable-key>', 'publishable_key');
 select vault.create_secret('<same-secret-as-edge-function>', 'content_processor_secret');
 ```
 
-Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit. `pg_cron` also invokes the content processor every minute as a recovery path.
+If you do not have an `anon_key` available in Vault and need a temporary fallback, you can store the service-role key instead:
 
-Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, `publishable_key`, and `content_processor_secret` values. The source refresh recovery cron now runs every 30 minutes.
+```sql
+select vault.create_secret('<your-service-role-key>', 'service_role_key');
+```
+
+The publishable key is only used for the `apikey` header. It is not sufficient for the `Authorization` bearer token on its own. Prefer the anon key here so the function invocation does not depend on admin credentials.
+
+Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit using `Authorization: Bearer ...`, the optional `apikey` header, and the shared `x-content-processor-secret`. `pg_cron` also invokes the content processor every minute as a recovery path.
+
+Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, bearer auth token, optional `publishable_key`, and `content_processor_secret` values. The source refresh recovery cron now runs every 30 minutes.
 
 ## Recommendation rollups
 
