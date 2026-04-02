@@ -10,14 +10,18 @@ mod recommendations;
 mod saved_content;
 mod source_subscriptions;
 
-use std::{net::SocketAddr, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, time::Duration};
 
 use axum::{
     Router,
     http::{Method, header::ACCEPT, header::AUTHORIZATION, header::CONTENT_TYPE},
     routing::{get, post, put},
 };
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool,
+    migrate::{MigrateError, Migrator},
+    postgres::PgPoolOptions,
+};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -32,6 +36,10 @@ pub struct AppState {
     auth_rate_limiter: AuthRateLimiter,
     pool: PgPool,
 }
+
+static MIGRATOR: Migrator = sqlx::migrate!();
+// This version exists in production's `_sqlx_migrations` history but is not present in git.
+const LEGACY_MISSING_MIGRATION_VERSIONS: &[i64] = &[20260320230000];
 
 #[tokio::main]
 async fn main() {
@@ -53,8 +61,7 @@ async fn main() {
         .await
         .expect("can't connect to database");
 
-    sqlx::migrate!()
-        .run(&pool)
+    run_database_migrations(&pool)
         .await
         .expect("failed to run database migrations");
 
@@ -175,4 +182,47 @@ fn build_cors_layer(config: &Config) -> CorsLayer {
             Method::OPTIONS,
         ])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
+}
+
+async fn run_database_migrations(pool: &PgPool) -> Result<(), MigrateError> {
+    match MIGRATOR.run(pool).await {
+        Ok(()) => Ok(()),
+        Err(MigrateError::VersionMissing(version)) => {
+            let missing_versions = load_missing_applied_migration_versions(pool).await?;
+
+            if !missing_versions.is_empty()
+                && missing_versions
+                    .iter()
+                    .all(|version| LEGACY_MISSING_MIGRATION_VERSIONS.contains(version))
+            {
+                tracing::warn!(
+                    missing_versions = ?missing_versions,
+                    "ignoring legacy database migration versions missing from the bundled migrations"
+                );
+
+                let mut migrator = sqlx::migrate!();
+                migrator.set_ignore_missing(true);
+                migrator.run(pool).await
+            } else {
+                Err(MigrateError::VersionMissing(version))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_missing_applied_migration_versions(pool: &PgPool) -> Result<Vec<i64>, MigrateError> {
+    let bundled_versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<HashSet<_>>();
+    let applied_versions =
+        sqlx::query_scalar::<_, i64>("select version from _sqlx_migrations order by version asc")
+            .fetch_all(pool)
+            .await?;
+
+    Ok(applied_versions
+        .into_iter()
+        .filter(|version| !bundled_versions.contains(version))
+        .collect())
 }
