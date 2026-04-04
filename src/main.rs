@@ -2,6 +2,7 @@ mod auth;
 mod auth_api;
 mod config;
 mod content;
+mod device_http;
 mod embedded_content;
 mod error;
 mod profile;
@@ -65,7 +66,30 @@ async fn main() {
         .await
         .expect("failed to run database migrations");
 
-    let app = Router::new()
+    let app_state = AppState {
+        auth: SupabaseAuth::new(config.supabase.clone()),
+        auth_api: SupabaseAuthApi::new(&config.supabase),
+        auth_rate_limiter: AuthRateLimiter::default(),
+        pool,
+    };
+    let app = build_app(app_state, cors);
+
+    let listener = tokio::net::TcpListener::bind(config.bind_addr)
+        .await
+        .expect("failed to bind server listener");
+
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server exited unexpectedly");
+}
+
+fn build_app(app_state: AppState, cors: CorsLayer) -> Router {
+    Router::new()
         .route("/", get(profile::health))
         .route("/health", get(profile::health))
         .route("/auth/signup", post(auth_api::sign_up))
@@ -138,26 +162,9 @@ async fn main() {
                 .patch(source_subscriptions::update_inbox_item),
         )
         .route("/profiles/{username}", get(profile::public_profile))
+        .nest("/device/v1", device_http::router())
         .layer(cors)
-        .with_state(AppState {
-            auth: SupabaseAuth::new(config.supabase.clone()),
-            auth_api: SupabaseAuthApi::new(&config.supabase),
-            auth_rate_limiter: AuthRateLimiter::default(),
-            pool,
-        });
-
-    let listener = tokio::net::TcpListener::bind(config.bind_addr)
-        .await
-        .expect("failed to bind server listener");
-
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
-
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .expect("server exited unexpectedly");
+        .with_state(app_state)
 }
 
 fn build_cors_layer(config: &Config) -> CorsLayer {
