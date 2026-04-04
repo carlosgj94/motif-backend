@@ -3,6 +3,7 @@ mod auth_api;
 mod config;
 mod content;
 mod device_http;
+mod device_reader_package;
 mod embedded_content;
 mod error;
 mod profile;

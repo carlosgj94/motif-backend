@@ -5,7 +5,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -21,12 +21,13 @@ use crate::{
     content::{
         NormalizedUrl, ProcessingStatus, ReadState, SourceKind, TagScope, normalize_tag_slug,
     },
+    device_reader_package,
     embedded_content::{
         CompactContentBody, build_compact_content_body, maybe_timestamp_seconds,
         parse_db_processing_status, parse_db_read_state, parse_db_tag_scope,
         parse_optional_source_kind, timestamp_seconds,
     },
-    error::{ApiError, ApiResult},
+    error::{self, ApiError, ApiResult},
     recommendations::{
         InternalEventType, record_internal_content_event, sync_recommendation_targets_for_signal,
     },
@@ -244,6 +245,29 @@ pub async fn get_saved_content(
         .unwrap_or_default();
 
     Ok(Json(build_saved_content_detail(row, tags)?))
+}
+
+pub async fn get_saved_content_package(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(saved_content_id): Path<Uuid>,
+) -> ApiResult<Response> {
+    let row = fetch_saved_content_detail_row(&state.pool, user.user_id, saved_content_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Saved content was not found"))?;
+    let source_kind = parse_optional_source_kind(row.source_kind.as_deref())?;
+    let body = row
+        .parsed_document
+        .as_ref()
+        .and_then(|value| build_compact_content_body(&value.0, source_kind))
+        .ok_or_else(|| ApiError::conflict("Content package is not ready"))?;
+    let bytes = device_reader_package::build_bytes(row.title.as_deref(), &body, 0)?;
+
+    Ok(error::bytes_response(
+        StatusCode::OK,
+        bytes.into(),
+        device_reader_package::CONTENT_TYPE,
+    ))
 }
 
 pub async fn update_saved_content(

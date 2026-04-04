@@ -27,13 +27,22 @@ pub fn router() -> Router<AppState> {
             "/me/saved-content/{saved_content_id}",
             get(get_saved_content),
         )
+        .route(
+            "/me/saved-content/{saved_content_id}/package",
+            get(get_saved_content_package),
+        )
         .route("/me/inbox", get(list_inbox))
         .route("/me/inbox/{inbox_item_id}", get(get_inbox_item))
+        .route(
+            "/me/inbox/{inbox_item_id}/package",
+            get(get_inbox_item_package),
+        )
         .route(
             "/me/recommendations/content",
             get(list_content_recommendations),
         )
         .route("/me/content/{content_id}", get(get_content_detail))
+        .route("/me/content/{content_id}/package", get(get_content_package))
         .fallback(device_not_found)
         .method_not_allowed_fallback(device_method_not_allowed)
 }
@@ -75,6 +84,14 @@ async fn get_saved_content(
         .map(map_json)
 }
 
+async fn get_saved_content_package(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(saved_content_id): DevicePath<Uuid>,
+) -> Result<Response, ApiError> {
+    saved_content::get_saved_content_package(user, State(state), Path(saved_content_id)).await
+}
+
 async fn list_inbox(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -95,6 +112,14 @@ async fn get_inbox_item(
         .map(map_json)
 }
 
+async fn get_inbox_item_package(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(inbox_item_id): DevicePath<Uuid>,
+) -> Result<Response, ApiError> {
+    source_subscriptions::get_inbox_item_package(user, State(state), Path(inbox_item_id)).await
+}
+
 async fn list_content_recommendations(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -113,6 +138,14 @@ async fn get_content_detail(
     recommendations::get_content_detail(user, State(state), Path(content_id))
         .await
         .map(map_json)
+}
+
+async fn get_content_package(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(content_id): DevicePath<Uuid>,
+) -> Result<Response, ApiError> {
+    recommendations::get_content_package(user, State(state), Path(content_id)).await
 }
 
 async fn device_not_found() -> ApiError {

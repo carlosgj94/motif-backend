@@ -6,6 +6,8 @@ use std::{
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,11 +19,12 @@ use crate::{
     AppState,
     auth::AuthenticatedUser,
     content::{ProcessingStatus, SourceKind, normalize_tag_slug},
+    device_reader_package,
     embedded_content::{
         CompactContentBody, build_compact_content_body, maybe_timestamp_seconds,
         parse_db_processing_status, parse_optional_source_kind,
     },
-    error::{ApiError, ApiResult},
+    error::{self, ApiError, ApiResult},
 };
 
 const DEFAULT_RECOMMENDATION_LIMIT: u32 = 20;
@@ -326,6 +329,61 @@ pub async fn get_content_detail(
     .ok_or_else(|| ApiError::not_found("Content was not found"))?;
 
     build_content_detail(row).map(Json)
+}
+
+pub async fn get_content_package(
+    _user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(content_id): Path<Uuid>,
+) -> ApiResult<Response> {
+    let row = sqlx::query_as::<_, RecommendationContentDetailRow>(
+        r#"
+        select
+            c.id as content_id,
+            c.canonical_url,
+            c.resolved_url,
+            c.host,
+            c.site_name,
+            c.source_kind,
+            c.title,
+            c.excerpt,
+            c.author,
+            c.published_at,
+            c.language_code,
+            (c.favicon_bytes is not null and c.favicon_mime_type is not null) as has_favicon,
+            c.fetch_status,
+            c.parse_status,
+            c.parsed_at,
+            c.parsed_document
+        from public.content c
+        where c.id = $1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(map_recommendation_error)?
+    .ok_or_else(|| ApiError::not_found("Content was not found"))?;
+
+    let body = row
+        .parsed_document
+        .as_ref()
+        .and_then(|document| {
+            build_compact_content_body(
+                &document.0,
+                parse_optional_source_kind(row.source_kind.as_deref())
+                    .ok()
+                    .flatten(),
+            )
+        })
+        .ok_or_else(|| ApiError::conflict("Content package is not ready"))?;
+    let bytes = device_reader_package::build_bytes(row.title.as_deref(), &body, 0)?;
+
+    Ok(error::bytes_response(
+        StatusCode::OK,
+        bytes.into(),
+        device_reader_package::CONTENT_TYPE,
+    ))
 }
 
 pub async fn ingest_interaction_events_batch(

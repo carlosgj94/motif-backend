@@ -76,13 +76,21 @@ pub(crate) fn serialize_json<T: Serialize>(value: &T) -> Result<Bytes, serde_jso
 }
 
 pub(crate) fn json_response(status: StatusCode, body: Bytes) -> Response {
+    bytes_response(status, body, "application/json")
+}
+
+pub(crate) fn bytes_response(
+    status: StatusCode,
+    body: Bytes,
+    content_type: &'static str,
+) -> Response {
     let content_length = HeaderValue::from_str(&body.len().to_string())
         .expect("content length header should be valid");
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response
         .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
         .headers_mut()
         .insert(CONTENT_LENGTH, content_length);

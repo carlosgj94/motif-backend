@@ -4,6 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::Response,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -16,12 +17,13 @@ use crate::{
     AppState,
     auth::AuthenticatedUser,
     content::{NormalizedUrl, ProcessingStatus, ReadState, SourceKind},
+    device_reader_package,
     embedded_content::{
         CompactContentBody, build_compact_content_body, maybe_timestamp_seconds,
         parse_db_processing_status, parse_db_read_state, parse_optional_source_kind,
         timestamp_seconds,
     },
-    error::{ApiError, ApiResult},
+    error::{self, ApiError, ApiResult},
     recommendations::{
         InternalEventType, record_internal_content_event, record_internal_source_event,
         sync_recommendation_targets_for_signal,
@@ -362,6 +364,85 @@ pub async fn get_inbox_item(
     .ok_or_else(|| ApiError::not_found("Inbox item was not found"))?;
 
     Ok(Json(build_inbox_detail(row)?))
+}
+
+pub async fn get_inbox_item_package(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(inbox_item_id): Path<Uuid>,
+) -> ApiResult<Response> {
+    let row = sqlx::query_as::<_, InboxDetailRow>(
+        r#"
+        select
+            i.id as inbox_item_id,
+            i.subscription_id,
+            i.delivered_at,
+            i.read_state,
+            i.dismissed_at,
+            i.created_at,
+            i.updated_at,
+            exists (
+                select 1
+                from public.saved_content sc
+                where sc.user_id = $2
+                  and sc.content_id = i.content_id
+            ) as is_saved,
+            cs.id as source_id,
+            cs.source_url,
+            cs.resolved_source_url,
+            cs.host as source_host,
+            cs.title as source_title,
+            cs.description as source_description,
+            cs.source_kind as source_kind,
+            cs.refresh_status,
+            cs.last_refreshed_at,
+            sf.feed_url as primary_feed_url,
+            c.id as content_id,
+            c.canonical_url,
+            c.resolved_url,
+            c.host as content_host,
+            c.site_name,
+            c.source_kind as content_source_kind,
+            c.title,
+            c.excerpt,
+            c.author,
+            c.published_at,
+            c.language_code,
+            (c.favicon_bytes is not null and c.favicon_mime_type is not null) as has_favicon,
+            c.fetch_status,
+            c.parse_status,
+            c.parsed_at,
+            c.parsed_document
+        from public.inbox_items i
+        join public.source_subscriptions ss on ss.id = i.subscription_id
+        join public.content_sources cs on cs.id = ss.source_id
+        left join public.source_feeds sf on sf.id = cs.primary_feed_id
+        join public.content c on c.id = i.content_id
+        where i.id = $1
+          and i.user_id = $2
+          and ss.user_id = $2
+        "#,
+    )
+    .bind(inbox_item_id)
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(map_source_error)?
+    .ok_or_else(|| ApiError::not_found("Inbox item was not found"))?;
+
+    let fallback_source_kind = parse_optional_source_kind(row.content_source_kind.as_deref())?;
+    let body = row
+        .parsed_document
+        .as_ref()
+        .and_then(|value| build_compact_content_body(&value.0, fallback_source_kind))
+        .ok_or_else(|| ApiError::conflict("Content package is not ready"))?;
+    let bytes = device_reader_package::build_bytes(row.content_title.as_deref(), &body, 0)?;
+
+    Ok(error::bytes_response(
+        StatusCode::OK,
+        bytes.into(),
+        device_reader_package::CONTENT_TYPE,
+    ))
 }
 
 pub async fn update_inbox_item(
