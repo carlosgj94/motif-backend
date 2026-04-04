@@ -176,7 +176,7 @@ The publishable key is only used for the `apikey` header. It is not sufficient f
 
 Once those exist, saves will enqueue processing jobs and the database will immediately kick the Edge Function after commit using `Authorization: Bearer ...`, the optional `apikey` header, and the shared `x-content-processor-secret`. `pg_cron` also invokes the content processor every minute as a recovery path.
 
-Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, bearer auth token, optional `publishable_key`, and `content_processor_secret` values. The source refresh recovery cron now runs every 30 minutes.
+Source subscriptions use the same Vault secrets and shared secret. The database helper `public.invoke_source_processor(...)` invokes `process-source-batch` with the same `project_url`, bearer auth token, optional `publishable_key`, and `content_processor_secret` values. The source refresh recovery cron runs every minute.
 
 ## Recommendation rollups
 

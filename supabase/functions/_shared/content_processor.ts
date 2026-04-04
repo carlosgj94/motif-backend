@@ -17,6 +17,7 @@ const DEFAULT_MAX_REDIRECTS = 5;
 const DEFAULT_MAX_HTML_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_OEMBED_BYTES = 128 * 1024;
 const DEFAULT_FAVICON_MAX_BYTES = 256 * 1024;
+const DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query";
 const DEFAULT_MAX_PARSED_BLOCKS = 128;
 const DEFAULT_MAX_TEXT_CHARS = 4000;
 const DEFAULT_MAX_CODE_CHARS = 16_000;
@@ -3193,7 +3194,92 @@ async function resolvePublicDns(
   hostname: string,
   recordType: DnsRecordType,
 ): Promise<string[]> {
-  return await Deno.resolveDns(hostname, recordType) as string[];
+  try {
+    return await Deno.resolveDns(hostname, recordType) as string[];
+  } catch (error) {
+    if (isDnsNoDataError(error)) {
+      return [];
+    }
+
+    return await resolveDnsOverHttps(hostname, recordType);
+  }
+}
+
+export async function resolveDnsOverHttps(
+  hostname: string,
+  recordType: DnsRecordType,
+  fetchImpl: FetchImpl = fetch,
+): Promise<string[]> {
+  const endpoint = new URL(DNS_OVER_HTTPS_URL);
+  endpoint.searchParams.set("name", hostname);
+  endpoint.searchParams.set("type", recordType);
+
+  let response: Response;
+  try {
+    response = await fetchImpl(endpoint.toString(), {
+      headers: {
+        accept: "application/dns-json",
+        "user-agent": USER_AGENT,
+      },
+      signal: AbortSignal.timeout(httpTimeoutMs),
+    });
+  } catch (error) {
+    throw new Error(
+      `DNS-over-HTTPS lookup failed for ${hostname}: ${String(error)}`,
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `DNS-over-HTTPS lookup failed for ${hostname} with HTTP ${response.status}`,
+    );
+  }
+
+  return parseDnsOverHttpsAnswers(await response.json(), recordType);
+}
+
+export function parseDnsOverHttpsAnswers(
+  payload: unknown,
+  recordType: DnsRecordType,
+): string[] {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("DNS-over-HTTPS response was invalid");
+  }
+
+  const response = payload as {
+    Status?: unknown;
+    Answer?: unknown;
+  };
+  if (typeof response.Status === "number" && response.Status !== 0) {
+    if (response.Status === 3) {
+      return [];
+    }
+
+    throw new Error(
+      `DNS-over-HTTPS lookup failed with status ${response.Status}`,
+    );
+  }
+
+  if (!Array.isArray(response.Answer)) {
+    return [];
+  }
+
+  const expectedType = recordType === "A" ? 1 : 28;
+  return response.Answer.flatMap((answer) => {
+    if (!answer || typeof answer !== "object") {
+      return [];
+    }
+
+    const record = answer as {
+      type?: unknown;
+      data?: unknown;
+    };
+    if (record.type !== expectedType || typeof record.data !== "string") {
+      return [];
+    }
+
+    return [record.data];
+  });
 }
 
 function isDnsNoDataError(error: unknown): boolean {
