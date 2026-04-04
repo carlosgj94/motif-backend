@@ -1,157 +1,138 @@
-use std::str;
+use std::net::SocketAddr;
 
 use axum::{
-    Router,
-    body::{Body, Bytes, to_bytes},
-    extract::Request,
-    http::{
-        HeaderMap, HeaderValue, StatusCode,
-        header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
+    Json, Router,
+    extract::{
+        ConnectInfo, FromRequest, FromRequestParts, Path, Query, Request, State,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
     },
-    middleware::{self, Next},
-    response::Response,
+    http::{StatusCode, request::Parts},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
+use uuid::Uuid;
 
 use crate::{
-    AppState, auth_api, error::ApiError, profile, recommendations, saved_content,
-    source_subscriptions,
+    AppState, auth::AuthenticatedUser, auth_api, error, error::ApiError, profile, recommendations,
+    saved_content, source_subscriptions,
 };
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/auth/session/refresh", post(auth_api::refresh_session))
-        .route("/me", get(profile::me))
-        .route("/me/saved-content", get(saved_content::list_saved_content))
+        .route("/auth/session/refresh", post(refresh_session))
+        .route("/me", get(me))
+        .route("/me/saved-content", get(list_saved_content))
         .route(
             "/me/saved-content/{saved_content_id}",
-            get(saved_content::get_saved_content),
+            get(get_saved_content),
         )
-        .route("/me/inbox", get(source_subscriptions::list_inbox))
-        .route(
-            "/me/inbox/{inbox_item_id}",
-            get(source_subscriptions::get_inbox_item),
-        )
+        .route("/me/inbox", get(list_inbox))
+        .route("/me/inbox/{inbox_item_id}", get(get_inbox_item))
         .route(
             "/me/recommendations/content",
-            get(recommendations::list_content_recommendations),
+            get(list_content_recommendations),
         )
-        .route(
-            "/me/content/{content_id}",
-            get(recommendations::get_content_detail),
-        )
+        .route("/me/content/{content_id}", get(get_content_detail))
         .fallback(device_not_found)
-        .layer(middleware::from_fn(normalize_device_response))
+        .method_not_allowed_fallback(device_method_not_allowed)
+}
+
+async fn refresh_session(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    DeviceJson(payload): DeviceJson<auth_api::RefreshSessionRequest>,
+) -> Result<DeviceJson<auth_api::AuthFlowResponse>, ApiError> {
+    auth_api::refresh_session(State(state), ConnectInfo(remote_addr), Json(payload))
+        .await
+        .map(map_json)
+}
+
+async fn me(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<DeviceJson<profile::MeResponse>, ApiError> {
+    profile::me(user, State(state)).await.map(map_json)
+}
+
+async fn list_saved_content(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DeviceQuery(query): DeviceQuery<saved_content::ListSavedContentQuery>,
+) -> Result<DeviceJson<saved_content::SavedContentListResponse>, ApiError> {
+    saved_content::list_saved_content(user, State(state), Query(query))
+        .await
+        .map(map_json)
+}
+
+async fn get_saved_content(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(saved_content_id): DevicePath<Uuid>,
+) -> Result<DeviceJson<saved_content::SavedContentDetail>, ApiError> {
+    saved_content::get_saved_content(user, State(state), Path(saved_content_id))
+        .await
+        .map(map_json)
+}
+
+async fn list_inbox(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DeviceQuery(query): DeviceQuery<source_subscriptions::ListInboxQuery>,
+) -> Result<DeviceJson<source_subscriptions::InboxListResponse>, ApiError> {
+    source_subscriptions::list_inbox(user, State(state), Query(query))
+        .await
+        .map(map_json)
+}
+
+async fn get_inbox_item(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(inbox_item_id): DevicePath<Uuid>,
+) -> Result<DeviceJson<source_subscriptions::InboxItemDetail>, ApiError> {
+    source_subscriptions::get_inbox_item(user, State(state), Path(inbox_item_id))
+        .await
+        .map(map_json)
+}
+
+async fn list_content_recommendations(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DeviceQuery(query): DeviceQuery<recommendations::ListRecommendationsQuery>,
+) -> Result<DeviceJson<recommendations::ContentRecommendationListResponse>, ApiError> {
+    recommendations::list_content_recommendations(user, State(state), Query(query))
+        .await
+        .map(map_json)
+}
+
+async fn get_content_detail(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(content_id): DevicePath<Uuid>,
+) -> Result<DeviceJson<recommendations::RecommendationContentDetail>, ApiError> {
+    recommendations::get_content_detail(user, State(state), Path(content_id))
+        .await
+        .map(map_json)
 }
 
 async fn device_not_found() -> ApiError {
     ApiError::not_found("Route was not found")
 }
 
-async fn normalize_device_response(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
-    normalize_response(response).await
+async fn device_method_not_allowed() -> ApiError {
+    ApiError::with_status(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "Method not allowed",
+    )
 }
 
-async fn normalize_response(response: Response) -> Response {
-    let (mut parts, body) = response.into_parts();
-    let bytes = match to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::error!(error = %error, "failed to buffer device response body");
-            return finalize_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                HeaderMap::new(),
-                encode_error_body(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to buffer device response body",
-                ),
-            );
-        }
-    };
-
-    let status = parts.status;
-    let is_json = is_json_response(&parts.headers);
-
-    let body_bytes = if is_json {
-        bytes
-    } else if bytes.is_empty() && status.is_success() {
-        bytes
-    } else {
-        encode_error_body(status, plain_text_message(status, &bytes))
-    };
-
-    scrub_transport_headers(&mut parts.headers);
-
-    if body_bytes.is_empty() {
-        if !parts.headers.contains_key(CONTENT_LENGTH) {
-            parts
-                .headers
-                .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
-        }
-
-        return Response::from_parts(parts, Body::from(body_bytes));
-    }
-
-    parts
-        .headers
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    insert_content_length(&mut parts.headers, body_bytes.len());
-
-    Response::from_parts(parts, Body::from(body_bytes))
+fn map_json<T>(Json(value): Json<T>) -> DeviceJson<T> {
+    DeviceJson(value)
 }
 
-fn finalize_response(status: StatusCode, mut headers: HeaderMap, body: Bytes) -> Response {
-    scrub_transport_headers(&mut headers);
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    insert_content_length(&mut headers, body.len());
-
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
-}
-
-fn insert_content_length(headers: &mut HeaderMap, length: usize) {
-    let value =
-        HeaderValue::from_str(&length.to_string()).expect("content length header should be valid");
-    headers.insert(CONTENT_LENGTH, value);
-}
-
-fn scrub_transport_headers(headers: &mut HeaderMap) {
-    headers.remove(TRANSFER_ENCODING);
-    headers.remove(CONTENT_ENCODING);
-}
-
-fn is_json_response(headers: &HeaderMap) -> bool {
-    headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"))
-}
-
-fn plain_text_message(status: StatusCode, bytes: &[u8]) -> String {
-    let message = str::from_utf8(bytes).unwrap_or_default().trim();
-    if message.is_empty() {
-        status
-            .canonical_reason()
-            .unwrap_or("Request failed")
-            .to_string()
-    } else {
-        message.to_string()
-    }
-}
-
-fn encode_error_body(status: StatusCode, message: impl Into<String>) -> Bytes {
-    let body = DeviceErrorBody {
-        error: error_code_for_status(status),
-        message: message.into(),
-    };
-
-    serde_json::to_vec(&body)
-        .map(Bytes::from)
-        .expect("device error body should serialize")
+fn map_rejection(status: StatusCode, message: String) -> ApiError {
+    ApiError::with_status(status, error_code_for_status(status), message)
 }
 
 fn error_code_for_status(status: StatusCode) -> &'static str {
@@ -170,26 +151,94 @@ fn error_code_for_status(status: StatusCode) -> &'static str {
     }
 }
 
-#[derive(Serialize)]
-struct DeviceErrorBody {
-    error: &'static str,
-    message: String,
+struct DeviceJson<T>(T);
+
+impl<T> IntoResponse for DeviceJson<T>
+where
+    T: Serialize,
+{
+    fn into_response(self) -> Response {
+        match error::serialize_json(&self.0) {
+            Ok(body) => error::json_response(StatusCode::OK, body),
+            Err(serialize_error) => {
+                tracing::error!(error = %serialize_error, "failed to serialize device response body");
+                ApiError::internal("Failed to serialize device response body").into_response()
+            }
+        }
+    }
+}
+
+impl<S, T> FromRequest<S> for DeviceJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(req, state)
+            .await
+            .map(map_json)
+            .map_err(map_json_rejection)
+    }
+}
+
+struct DeviceQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for DeviceQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .map_err(map_query_rejection)
+    }
+}
+
+struct DevicePath<T>(T);
+
+impl<S, T> FromRequestParts<S> for DevicePath<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .map_err(map_path_rejection)
+    }
+}
+
+fn map_json_rejection(rejection: JsonRejection) -> ApiError {
+    map_rejection(rejection.status(), rejection.body_text())
+}
+
+fn map_query_rejection(rejection: QueryRejection) -> ApiError {
+    map_rejection(rejection.status(), rejection.body_text())
+}
+
+fn map_path_rejection(rejection: PathRejection) -> ApiError {
+    map_rejection(rejection.status(), rejection.body_text())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_device_response;
     use super::*;
     use axum::{
-        Json,
-        extract::{Path, Query},
-        http::Request,
+        http::{Method, Request},
         routing::get,
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
     use tower::util::ServiceExt;
-    use uuid::Uuid;
 
     #[derive(Deserialize)]
     struct LimitQuery {
@@ -198,51 +247,57 @@ mod tests {
 
     fn test_app() -> Router {
         Router::new()
-            .route("/ok", get(|| async { Json(json!({ "ok": true })) }))
+            .route("/ok", get(|| async { DeviceJson(json!({ "ok": true })) }))
             .route(
                 "/large",
                 get(|| async {
-                    Json(json!({
+                    DeviceJson(json!({
                         "body": "device-transport".repeat(512),
                     }))
                 }),
             )
             .route(
                 "/json",
-                post(|Json(payload): Json<Value>| async move { Json(payload) }),
+                post(|DeviceJson(payload): DeviceJson<Value>| async move {
+                    DeviceJson(payload)
+                }),
             )
             .route(
                 "/query",
-                get(|Query(query): Query<LimitQuery>| async move {
-                    Json(json!({ "limit": query.limit }))
+                get(|DeviceQuery(query): DeviceQuery<LimitQuery>| async move {
+                    DeviceJson(json!({ "limit": query.limit }))
                 }),
             )
             .route(
                 "/path/{id}",
-                get(|Path(id): Path<Uuid>| async move { Json(json!({ "id": id })) }),
+                get(|DevicePath(id): DevicePath<Uuid>| async move {
+                    DeviceJson(json!({ "id": id }))
+                }),
             )
-            .layer(middleware::from_fn(normalize_device_response))
+            .fallback(device_not_found)
+            .method_not_allowed_fallback(device_method_not_allowed)
     }
 
     #[tokio::test]
     async fn successful_json_response_has_device_headers() {
         let response = test_app()
-            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
-        assert!(response.headers().get(TRANSFER_ENCODING).is_none());
-        assert!(response.headers().get(CONTENT_ENCODING).is_none());
-        let content_length = response.headers()[CONTENT_LENGTH]
-            .to_str()
-            .unwrap()
-            .to_string();
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["content-length"], "11");
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, Bytes::from_static(br#"{"ok":true}"#));
-        assert_eq!(content_length, body.len().to_string());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, axum::body::Bytes::from_static(br#"{"ok":true}"#));
     }
 
     #[tokio::test]
@@ -250,19 +305,21 @@ mod tests {
         let response = test_app()
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method(Method::POST)
                     .uri("/json")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from("{"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{"))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["content-type"], "application/json");
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "bad_request");
         assert!(body["message"].as_str().is_some_and(|message| {
@@ -275,18 +332,20 @@ mod tests {
         let response = test_app()
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method(Method::POST)
                     .uri("/json")
-                    .body(Body::from("{}"))
+                    .body(axum::body::Body::from("{}"))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["content-type"], "application/json");
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "unsupported_media_type");
         assert_eq!(
@@ -301,22 +360,24 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/query?limit=abc")
-                    .body(Body::empty())
+                    .body(axum::body::Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["content-type"], "application/json");
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "bad_request");
         assert!(
-            body["message"]
-                .as_str()
-                .is_some_and(|message| message.starts_with("Failed to deserialize query string"))
+            body["message"].as_str().is_some_and(|message| {
+                message.starts_with("Failed to deserialize query string")
+            })
         );
     }
 
@@ -326,16 +387,18 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/path/not-a-uuid")
-                    .body(Body::empty())
+                    .body(axum::body::Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()["content-type"], "application/json");
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], "bad_request");
         assert!(
@@ -343,6 +406,53 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| !message.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_returns_json_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()["content-type"], "application/json");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "method_not_allowed");
+        assert_eq!(body["message"], "Method not allowed");
+    }
+
+    #[tokio::test]
+    async fn not_found_returns_json_error() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "application/json");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "not_found");
+        assert_eq!(body["message"], "Route was not found");
     }
 
     #[tokio::test]
@@ -360,38 +470,43 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/large")
-                    .body(Body::empty())
+                    .body(axum::body::Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(first.headers()[CONTENT_TYPE], "application/json");
-        assert!(first.headers().get(TRANSFER_ENCODING).is_none());
-        assert!(first.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(first.headers()["content-type"], "application/json");
         assert_eq!(
-            first.headers()[CONTENT_LENGTH].to_str().unwrap(),
+            first.headers()["content-length"].to_str().unwrap(),
             expected_large.len().to_string()
         );
-        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             String::from_utf8(first_body.to_vec()).unwrap(),
             expected_large
         );
 
         let second = app
-            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::OK);
-        assert_eq!(second.headers()[CONTENT_TYPE], "application/json");
-        assert!(second.headers().get(TRANSFER_ENCODING).is_none());
-        assert!(second.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(second.headers()["content-type"], "application/json");
         assert_eq!(
-            second.headers()[CONTENT_LENGTH].to_str().unwrap(),
+            second.headers()["content-length"].to_str().unwrap(),
             expected_ok.len().to_string()
         );
-        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             String::from_utf8(second_body.to_vec()).unwrap(),
             expected_ok
