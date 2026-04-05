@@ -13,6 +13,8 @@ import {
   extractThreadPosts,
   fetchDocument,
   isPublicIpLiteral,
+  parseDnsOverHttpsAnswers,
+  resolveDnsOverHttps,
   sanitizeParsedBlocks,
   validateFetchTargetUrl,
   xPostFromOEmbedPayload,
@@ -562,6 +564,45 @@ Deno.test("validateFetchTargetUrl rejects hosts that resolve to private IP space
       }),
     "must resolve to a public address",
   );
+});
+
+Deno.test("parseDnsOverHttpsAnswers returns only matching record types", () => {
+  const payload = {
+    Status: 0,
+    Answer: [
+      { type: 5, data: "example.com.cdn.cloudflare.net" },
+      { type: 1, data: "93.184.216.34" },
+      { type: 28, data: "2606:2800:220:1:248:1893:25c8:1946" },
+    ],
+  };
+
+  assertEquals(parseDnsOverHttpsAnswers(payload, "A"), ["93.184.216.34"]);
+  assertEquals(parseDnsOverHttpsAnswers(payload, "AAAA"), [
+    "2606:2800:220:1:248:1893:25c8:1946",
+  ]);
+});
+
+Deno.test("resolveDnsOverHttps parses JSON responses", async () => {
+  const addresses = await resolveDnsOverHttps(
+    "example.com",
+    "A",
+    async () =>
+      new Response(
+        JSON.stringify({
+          Status: 0,
+          Answer: [
+            { type: 5, data: "example.com.cdn.cloudflare.net" },
+            { type: 1, data: "93.184.216.34" },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/dns-json" },
+        },
+      ),
+  );
+
+  assertEquals(addresses, ["93.184.216.34"]);
 });
 
 Deno.test("fetchDocument rejects redirects to blocked destinations", async () => {

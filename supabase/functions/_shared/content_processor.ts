@@ -89,9 +89,11 @@ export {
   fetchDocument,
   isDisallowedHostname,
   isPublicIpLiteral,
+  parseDnsOverHttpsAnswers,
   performValidatedFetch,
   readResponseBytes,
   readResponseText,
+  resolveDnsOverHttps,
   validateFetchTargetUrl,
 } from "./content/fetch.ts";
 export {
