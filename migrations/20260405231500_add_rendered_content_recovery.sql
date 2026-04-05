@@ -56,6 +56,8 @@ begin
 end;
 $$;
 
+drop function if exists public.claim_content_recovery(uuid, integer);
+
 create or replace function public.claim_content_recovery(
     p_content_id uuid,
     p_stale_after_seconds integer default 900
@@ -406,6 +408,7 @@ revoke all on function public.enqueue_content_render_recovery(uuid, text, intege
 revoke all on function public.dequeue_content_render_recovery(integer, integer) from public, anon, authenticated;
 revoke all on function public.archive_content_render_recovery(bigint) from public, anon, authenticated;
 revoke all on function public.enqueue_due_content_render_recoveries(integer) from public, anon, authenticated;
+revoke all on function public.claim_content_recovery(uuid, integer) from public, anon, authenticated;
 revoke all on function public.claim_content_render_recovery(uuid, integer) from public, anon, authenticated;
 revoke all on function public.invoke_content_render_recovery_processor(jsonb) from public, anon, authenticated;
 
@@ -413,6 +416,7 @@ grant execute on function public.enqueue_content_render_recovery(uuid, text, int
 grant execute on function public.dequeue_content_render_recovery(integer, integer) to service_role;
 grant execute on function public.archive_content_render_recovery(bigint) to service_role;
 grant execute on function public.enqueue_due_content_render_recoveries(integer) to service_role;
+grant execute on function public.claim_content_recovery(uuid, integer) to service_role;
 grant execute on function public.claim_content_render_recovery(uuid, integer) to service_role;
 grant execute on function public.invoke_content_render_recovery_processor(jsonb) to service_role;
 

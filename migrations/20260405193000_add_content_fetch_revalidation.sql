@@ -3,6 +3,8 @@ alter table public.content
     add column fetch_last_modified text,
     add column parser_quality_score integer;
 
+drop function if exists public.claim_content_processing(uuid, integer);
+
 create or replace function public.claim_content_processing(
     p_content_id uuid,
     p_stale_after_seconds integer default 900
@@ -57,3 +59,6 @@ begin
         c.parse_attempt_count;
 end;
 $$;
+
+revoke all on function public.claim_content_processing(uuid, integer) from public, anon, authenticated;
+grant execute on function public.claim_content_processing(uuid, integer) to service_role;
