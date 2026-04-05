@@ -1,0 +1,17 @@
+{
+  "kind": "article",
+  "blocks": [
+    {
+      "t": "p",
+      "x": "Shipping the future of research agents."
+    },
+    {
+      "t": "p",
+      "x": "This is the first paragraph of a longer argument about why personal knowledge tools need better retrieval and memory primitives."
+    },
+    {
+      "t": "p",
+      "x": "The second paragraph explains how the system should feel for readers on constrained devices."
+    }
+  ]
+}

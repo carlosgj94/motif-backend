@@ -3,6 +3,8 @@
 Rust API for authentication, saved content, subscriptions, inbox delivery, and recommendations.
 
 For environment setup and Supabase configuration, see [AUTH_SETUP.md](./AUTH_SETUP.md).
+For the parser/extractor rebuild sequence, see [docs/content-parser-rebuild-plan.md](./docs/content-parser-rebuild-plan.md).
+For the internal rendered recovery service, see [services/content-renderer/README.md](./services/content-renderer/README.md).
 
 ## Toolchain
 

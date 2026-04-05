@@ -1,0 +1,32 @@
+{
+  "sourceKind": "article",
+  "title": "Shipping the future of research agents.",
+  "excerpt": "This is the first paragraph of a longer argument about why personal knowledge tools need better retrieval and memory primitives.",
+  "author": "Kevin Gu",
+  "publishedAt": "2026-04-05T10:30:00.000Z",
+  "languageCode": null,
+  "siteName": "X",
+  "coverImageUrl": "https://pbs.twimg.com/media/kevin-long.png",
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "Shipping the future of research agents.",
+    "byline": "Kevin Gu",
+    "published_at": "2026-04-05T10:30:00.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "Shipping the future of research agents."
+      },
+      {
+        "type": "paragraph",
+        "text": "This is the first paragraph of a longer argument about why personal knowledge tools need better retrieval and memory primitives."
+      },
+      {
+        "type": "paragraph",
+        "text": "The second paragraph explains how the system should feel for readers on constrained devices."
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "sourceKind": "article",
+  "title": "Descartes y dividir problemas",
+  "excerpt": "Sinceridad ante todo. Lo que tenía entre mis manos era una idea vieja con aplicaciones muy actuales.",
+  "author": "Carlos Prego",
+  "publishedAt": "2026-04-05T11:00:56.000Z",
+  "languageCode": null,
+  "siteName": "Xataka",
+  "coverImageUrl": "https://i.blogs.es/archive-descartes.png",
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "Descartes y dividir problemas",
+    "byline": "Carlos Prego",
+    "published_at": "2026-04-05T11:00:56.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "Descartes proponía dividir cada dificultad en tantas partes como fuera necesario para su mejor solución."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Dudando de todo"
+      },
+      {
+        "type": "paragraph",
+        "text": "Para salir del atolladero epistemológico, el filósofo utilizó la duda contra la duda misma."
+      }
+    ]
+  }
+}

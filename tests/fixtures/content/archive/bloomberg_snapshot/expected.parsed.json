@@ -1,0 +1,32 @@
+{
+  "sourceKind": "article",
+  "title": "AI Perfected Chess. Humans Made It Unpredictable Again",
+  "excerpt": "Artificial intelligence drove chess toward perfect play, leading to more draws at top tournaments. Now grandmasters are winning by making less optimal moves.",
+  "author": "Kevin Lincoln",
+  "publishedAt": "2026-03-27T08:00:00.000Z",
+  "languageCode": null,
+  "siteName": "Bloomberg",
+  "coverImageUrl": "https://assets.bwbx.io/images/chess-hero.webp",
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "AI Perfected Chess. Humans Made It Unpredictable Again",
+    "byline": "Kevin Lincoln",
+    "published_at": "2026-03-27T08:00:00.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "At the biannual 2018 World Chess Championship, Magnus Carlsen defended his title against challenger Fabiano Caruana in a best-of-12 format. Classical chess allows players long stretches of time in which to make their moves, and the two logged more than 50 hours of play across 12 games. To the shock of the chess world, every single game resulted in a draw, a first in the history of the championship."
+      },
+      {
+        "type": "paragraph",
+        "text": "This seemed to confirm a growing suspicion: Chess was dead and draws had killed it. But modern engines also changed how players prepare, creating a strange situation where the strongest moves are often understood best by computers while humans still have to navigate the practical game over the board."
+      },
+      {
+        "type": "paragraph",
+        "text": "The next generation of grandmasters responded by searching for moves that were not strictly optimal but were difficult for other humans to solve. That pushed elite chess back toward surprise, psychology and practical pressure, making classical games more decisive again."
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "sourceKind": "post",
+  "title": "Shipping better tools for agents.",
+  "excerpt": "Shipping better tools for agents.",
+  "author": "OpenAI",
+  "publishedAt": "2026-03-17T12:30:00.000Z",
+  "languageCode": null,
+  "siteName": "X",
+  "coverImageUrl": "https://pbs.twimg.com/media/thread-image.jpg",
+  "parsedDocument": {
+    "version": 1,
+    "kind": "post",
+    "title": "Shipping better tools for agents.",
+    "byline": "OpenAI",
+    "published_at": "2026-03-17T12:30:00.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "thread_post",
+        "post_id": "777",
+        "author_handle": "OpenAI",
+        "display_name": "OpenAI",
+        "published_at": "2026-03-17T12:30:00.000Z",
+        "text": "Shipping better tools for agents.",
+        "media": [
+          {
+            "kind": "image",
+            "url": "https://pbs.twimg.com/media/thread-image.jpg",
+            "alt": "thread image"
+          }
+        ]
+      }
+    ]
+  }
+}

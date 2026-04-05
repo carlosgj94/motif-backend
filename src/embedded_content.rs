@@ -264,3 +264,79 @@ fn is_compact_body_kind(kind: SourceKind) -> bool {
 fn json_string<'a>(value: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
     value.get(key)?.as_str()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use serde_json::Value;
+
+    use super::{CompactContentBody, build_compact_content_body};
+    use crate::content::SourceKind;
+
+    fn content_fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("content")
+    }
+
+    fn read_fixture_json(provider: &str, name: &str, file_name: &str) -> Value {
+        let path = content_fixture_root()
+            .join(provider)
+            .join(name)
+            .join(file_name);
+        serde_json::from_str(&fs::read_to_string(path).expect("fixture file should read"))
+            .expect("fixture json should parse")
+    }
+
+    fn compact_body_from_fixture(
+        provider: &str,
+        name: &str,
+        fallback_kind: SourceKind,
+    ) -> CompactContentBody {
+        let expected_parsed = read_fixture_json(provider, name, "expected.parsed.json");
+        let parsed_document = expected_parsed
+            .get("parsedDocument")
+            .expect("fixture should include parsedDocument");
+
+        build_compact_content_body(parsed_document, Some(fallback_kind))
+            .expect("compact body should build")
+    }
+
+    #[test]
+    fn builds_compact_body_from_content_fixtures() {
+        let cases = [
+            ("generic", "simple_post", SourceKind::Article),
+            ("generic", "xataka_descartes", SourceKind::Article),
+            (
+                "generic",
+                "juar_motif_crafted_for_motion",
+                SourceKind::Article,
+            ),
+            ("generic", "jazzsequence_cms_is_dead", SourceKind::Article),
+            ("live_blog", "guardian_cop30", SourceKind::Article),
+            (
+                "substack",
+                "one_useful_thing_shape_of_the_thing",
+                SourceKind::Article,
+            ),
+            ("bloomberg", "ai_perfected_chess", SourceKind::Article),
+            ("archive", "bloomberg_snapshot", SourceKind::Article),
+            ("archive", "xataka_snapshot", SourceKind::Article),
+            ("x", "karpathy_note_tweet_real_capture", SourceKind::Post),
+            ("x", "kevingu_article_real_capture", SourceKind::Article),
+            ("x", "long_post", SourceKind::Article),
+            ("x", "single_post", SourceKind::Post),
+        ];
+
+        for (provider, name, fallback_kind) in cases {
+            let actual = compact_body_from_fixture(provider, name, fallback_kind);
+            let expected = read_fixture_json(provider, name, "expected.compact.json");
+            assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        }
+    }
+}

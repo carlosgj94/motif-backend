@@ -1,0 +1,46 @@
+{
+  "sourceKind": "article",
+  "title": "Simple Post",
+  "excerpt": "Motif should treat parser infrastructure as a product surface.",
+  "author": "Alice Example",
+  "publishedAt": "2026-03-12T00:00:00.000Z",
+  "languageCode": "en",
+  "siteName": "Example Blog",
+  "coverImageUrl": null,
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "Simple Post",
+    "byline": "Alice Example",
+    "published_at": "2026-03-12T00:00:00.000Z",
+    "language_code": "en",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "Motif should treat parser infrastructure as a product surface."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Why it matters"
+      },
+      {
+        "type": "paragraph",
+        "text": "Readers on constrained devices need signal, not layout chrome."
+      },
+      {
+        "type": "list",
+        "style": "bulleted",
+        "items": [
+          "Preserve structure",
+          "Drop repetitive UI noise"
+        ]
+      },
+      {
+        "type": "code",
+        "language": null,
+        "text": "export function score() {\n  return 1;\n}"
+      }
+    ]
+  }
+}

@@ -284,11 +284,19 @@ Deno.test("extractArchiveSnapshot keeps the first archive.is article and removes
   }
 
   assertEquals(snapshot.articleHtml.includes("More From Bloomberg"), false);
-  assertEquals(snapshot.articleHtml.includes("Bloomberg Weekend newsletter"), false);
+  assertEquals(
+    snapshot.articleHtml.includes("Bloomberg Weekend newsletter"),
+    false,
+  );
   assertEquals(snapshot.articleHtml.includes("Privacy Policy"), false);
   assertEquals(snapshot.articleHtml.includes("Follow all new stories"), false);
   assertEquals(snapshot.articleHtml.includes("Get Alerts"), false);
-  assertEquals(snapshot.articleHtml.includes("At the biannual 2018 World Chess Championship"), true);
+  assertEquals(
+    snapshot.articleHtml.includes(
+      "At the biannual 2018 World Chess Championship",
+    ),
+    true,
+  );
 
   const blocks = buildArticleBlocks(snapshot.articleHtml, archiveUrl);
   assertEquals(
@@ -617,13 +625,17 @@ Deno.test("fetchDocument falls back to another archive mirror after a 429", asyn
       }
 
       if (url === mirrorUrl) {
-        return new Response("<html><body><article><p>Mirror fetch worked.</p></article></body></html>", {
-          status: 200,
-          headers: {
-            "content-type": "text/html; charset=utf-8",
-            link: "<https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves>; rel=\"original\"",
+        return new Response(
+          "<html><body><article><p>Mirror fetch worked.</p></article></body></html>",
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              link:
+                '<https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves>; rel="original"',
+            },
           },
-        });
+        );
       }
 
       throw new Error(`unexpected fetch: ${url}`);
@@ -636,6 +648,46 @@ Deno.test("fetchDocument falls back to another archive mirror after a 429", asyn
     host: "archive.ph",
     originalUrl:
       "https://www.bloomberg.com/news/articles/2026-03-27/ai-changed-chess-grandmasters-now-win-with-unpredictable-moves",
+  });
+});
+
+Deno.test("fetchDocument sends conditional headers and handles 304 not modified", async () => {
+  let capturedIfNoneMatch = "";
+  let capturedIfModifiedSince = "";
+
+  const result = await fetchDocument(
+    "https://example.com/article",
+    {
+      resolveDns: async () => ["93.184.216.34"],
+      fetchImpl: async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        capturedIfNoneMatch = headers.get("if-none-match") ?? "";
+        capturedIfModifiedSince = headers.get("if-modified-since") ?? "";
+        return new Response(null, {
+          status: 304,
+          headers: {
+            etag: '"next-etag"',
+            "last-modified": "Sat, 05 Apr 2026 10:00:00 GMT",
+          },
+        });
+      },
+    },
+    {
+      etag: '"previous-etag"',
+      lastModified: "Fri, 04 Apr 2026 10:00:00 GMT",
+    },
+  );
+
+  assertEquals(capturedIfNoneMatch, '"previous-etag"');
+  assertEquals(capturedIfModifiedSince, "Fri, 04 Apr 2026 10:00:00 GMT");
+  assertObjectMatch(result as unknown as { [key: string]: unknown }, {
+    resolvedUrl: "https://example.com/article",
+    host: "example.com",
+    status: 304,
+    html: "",
+    etag: '"next-etag"',
+    lastModified: "Sat, 05 Apr 2026 10:00:00 GMT",
+    notModified: true,
   });
 });
 

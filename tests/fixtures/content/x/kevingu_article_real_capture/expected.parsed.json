@@ -1,0 +1,28 @@
+{
+  "sourceKind": "article",
+  "title": "AutoAgent: first open source library for self-optimizing agents",
+  "excerpt": "today we're releasing AutoAgent, an open source library for autonomously improving an agent on any domain.\nAutoAgent hit both the #1 on SpreadsheetBench (96.5%) and the #1 GPT-5 score on TerminalBench",
+  "author": "Kevin Gu",
+  "publishedAt": "2026-04-02T23:11:40.000Z",
+  "languageCode": null,
+  "siteName": "X",
+  "coverImageUrl": "https://pbs.twimg.com/media/HE7dfFlasAA3nJb.jpg",
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "AutoAgent: first open source library for self-optimizing agents",
+    "byline": "Kevin Gu",
+    "published_at": "2026-04-02T23:11:40.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "today we're releasing AutoAgent, an open source library for autonomously improving an agent on any domain."
+      },
+      {
+        "type": "paragraph",
+        "text": "AutoAgent hit both the #1 on SpreadsheetBench (96.5%) and the #1 GPT-5 score on TerminalBench"
+      }
+    ]
+  }
+}

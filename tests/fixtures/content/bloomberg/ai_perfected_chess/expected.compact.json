@@ -1,0 +1,17 @@
+{
+  "kind": "article",
+  "blocks": [
+    {
+      "t": "p",
+      "x": "At the biannual 2018 World Chess Championship, Magnus Carlsen defended his title against challenger Fabiano Caruana in a best-of-12 format."
+    },
+    {
+      "t": "p",
+      "x": "This seemed to confirm a growing suspicion: Chess was dead and draws had killed it."
+    },
+    {
+      "t": "p",
+      "x": "The next generation of grandmasters responded by searching for moves that were not strictly optimal but were difficult for other humans to solve."
+    }
+  ]
+}

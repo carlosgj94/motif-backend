@@ -1,0 +1,14 @@
+{
+  "kind": "post",
+  "blocks": [
+    {
+      "t": "h",
+      "l": 3,
+      "x": "Andrej Karpathy (@karpathy)"
+    },
+    {
+      "t": "p",
+      "x": "LLM Knowledge Bases\n\nSomething I'm finding very useful recently: using LLMs to build personal knowledge bases for various topics of research interest. In this way, a large fraction of my recent token throughput is going less into manipulating code, and more into manipulating"
+    }
+  ]
+}

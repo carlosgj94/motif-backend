@@ -1,0 +1,36 @@
+{
+  "sourceKind": "article",
+  "title": "Motif, crafted for motion",
+  "excerpt": "Everywhere I look, there’s people talking about how content is getting worse, AI slop, vague posting, noise… And sure, some of that is true. There is more content than ever before, and a big part of it is generated quickly, with little thought behind it, without the human touch",
+  "author": "juar.eth 🦉",
+  "publishedAt": "2026-03-26T18:06:18.000Z",
+  "languageCode": "en",
+  "siteName": "juar.es",
+  "coverImageUrl": null,
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "Motif, crafted for motion",
+    "byline": "juar.eth 🦉",
+    "published_at": "2026-03-26T18:06:18.000Z",
+    "language_code": "en",
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "Everywhere I look, there’s people talking about how content is getting worse, AI slop, vague posting, noise… And sure, some of that is true. There is more content than ever before, and a big part of it is generated quickly, with little thought behind it, without the human touch and connection that makes things “click” in us. But if I take a step back, I don’t think that tells the full story. Is everything you read actually bad? Is everything people write just generated junk? Definitely not. I don’t consider most of what I write to be slop, and I know I’m not an exception. There are more people writing, thinking, and sharing ideas than ever before, and within that there is a surprising amount of genuinely good content. What’s actually happening is something deeper, and honestly a bit sad. Content gets created, it gets a brief moment of attention, and then it disappears. Not because it wasn’t valuable, but because the system around it is built that way. “In the future, everyone will be world-famous for 15 minutes” said Andy Warhol, but at the pace things are going, if we don’t change anything, I don’t think people will even have the patience for that. Today, content is expected to be consumed quickly, compete for attention immediately, and then make space for whatever comes next. Feeds move, timelines refresh, and even the highest quality pieces get buried within hours. Content comes with an expiration date, not because of its writing, but because the platform lifecycle is designed that way."
+      },
+      {
+        "type": "paragraph",
+        "text": "So if good content exists, is the solution simply better discovery? Better algorithms, better curation, better ways to surface what matters… the nerd in me starts mouth watering. But sadly, that’s not enough. When you do find something worth reading, something you actually want to spend time with, the experience itself breaks down. The devices we use today are simply not built for this type of content. Phones are designed for interruption. You open something you want to read, and within seconds you’ve been dragged into a video of a different way of cooking Chinese noodles (well, maybe that’s only me). Good luck going back to that article that could have changed your relationship, helped you get that promotion or made you understand the history of your own heritage. Next thought is Kindles, but guess what Amazon’s business model is here. Not selling the device, that’s for sure. It’s selling you ebooks. Internet native content works against that, so it’s simply not a priority. Articles, blogs, conversations, they all become second class citizens. And that’s the problem. Even when you find something worth reading, the way we consume it is fundamentally broken."
+      },
+      {
+        "type": "paragraph",
+        "text": "This is why we’re building Motif. Not from the idea of building a better Kindle, or a nicer app, but from a more basic question: what should happen the moment you decide to read? Whether you have two minutes or an hour, that moment should feel simple, tailored. You pick something up, and you stay with it. No friction, no distractions, no sense that you’re fighting the device to keep your attention where you want it. Motif focuses on bringing back a bit of humanity to the act of reading. Letting you enjoy freshly baked content, actually digest it, and maybe even talk about it later with your friends. Not something you skim and forget, but something that sticks with you for a while. An experience where internet native content is treated as first class, articles, blog posts, threads, chats, things you save and come back to."
+      },
+      {
+        "type": "paragraph",
+        "text": "And if this works, something else starts to shift. When good content doesn’t immediately disappear, more people start writing it. When there’s a place where ideas are actually read and revisited, not just rushed through and buried, it changes the incentive to create. We already have more tools than ever to think and explore ideas, LLMs included, but most of that potential gets lost in feeds. Fix the environment, and you start getting more signal, not more noise. It’s not about reading more. If anything, probably less. But actually finishing what you start, remembering what you read, letting things sit for a bit. That’s the direction. Just a better place to read."
+      }
+    ]
+  }
+}

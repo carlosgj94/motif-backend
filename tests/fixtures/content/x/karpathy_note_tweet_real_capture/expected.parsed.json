@@ -1,0 +1,29 @@
+{
+  "sourceKind": "post",
+  "title": "LLM Knowledge Bases",
+  "excerpt": "Something I'm finding very useful recently: using LLMs to build personal knowledge bases for various topics of research interest. In this way, a large fraction of my recent token throughput is going less into manipulating code, and more into manipulating",
+  "author": "Andrej Karpathy",
+  "publishedAt": "2026-04-02T20:42:21.000Z",
+  "languageCode": null,
+  "siteName": "X",
+  "coverImageUrl": null,
+  "parsedDocument": {
+    "version": 1,
+    "kind": "post",
+    "title": "LLM Knowledge Bases",
+    "byline": "Andrej Karpathy",
+    "published_at": "2026-04-02T20:42:21.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "thread_post",
+        "post_id": "2039805659525644595",
+        "author_handle": "karpathy",
+        "display_name": "Andrej Karpathy",
+        "published_at": "2026-04-02T20:42:21.000Z",
+        "text": "LLM Knowledge Bases\n\nSomething I'm finding very useful recently: using LLMs to build personal knowledge bases for various topics of research interest. In this way, a large fraction of my recent token throughput is going less into manipulating code, and more into manipulating",
+        "media": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "kind": "article",
+  "blocks": [
+    {
+      "t": "p",
+      "x": "Motif should treat parser infrastructure as a product surface."
+    },
+    {
+      "t": "h",
+      "l": 2,
+      "x": "Why it matters"
+    },
+    {
+      "t": "p",
+      "x": "Readers on constrained devices need signal, not layout chrome."
+    },
+    {
+      "t": "l",
+      "o": false,
+      "i": [
+        "Preserve structure",
+        "Drop repetitive UI noise"
+      ]
+    },
+    {
+      "t": "c",
+      "x": "export function score() {\n  return 1;\n}"
+    }
+  ]
+}

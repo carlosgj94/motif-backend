@@ -1,0 +1,18 @@
+{
+  "kind": "article",
+  "blocks": [
+    {
+      "t": "p",
+      "x": "Descartes proponía dividir cada dificultad en tantas partes como fuera necesario para su mejor solución."
+    },
+    {
+      "t": "h",
+      "l": 2,
+      "x": "Dudando de todo"
+    },
+    {
+      "t": "p",
+      "x": "Para salir del atolladero epistemológico, el filósofo utilizó la duda contra la duda misma."
+    }
+  ]
+}

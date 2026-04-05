@@ -1,0 +1,32 @@
+{
+  "sourceKind": "article",
+  "title": "AI Perfected Chess. Humans Made It Unpredictable Again",
+  "excerpt": "Artificial intelligence drove chess toward perfect play, leading to more draws at top tournaments. Now grandmasters are winning by making less optimal moves.",
+  "author": "Kevin Lincoln",
+  "publishedAt": "2026-03-27T08:00:00.000Z",
+  "languageCode": null,
+  "siteName": "Bloomberg",
+  "coverImageUrl": "https://assets.bwbx.io/images/chess-hero.webp",
+  "parsedDocument": {
+    "version": 1,
+    "kind": "article",
+    "title": "AI Perfected Chess. Humans Made It Unpredictable Again",
+    "byline": "Kevin Lincoln",
+    "published_at": "2026-03-27T08:00:00.000Z",
+    "language_code": null,
+    "blocks": [
+      {
+        "type": "paragraph",
+        "text": "At the biannual 2018 World Chess Championship, Magnus Carlsen defended his title against challenger Fabiano Caruana in a best-of-12 format."
+      },
+      {
+        "type": "paragraph",
+        "text": "This seemed to confirm a growing suspicion: Chess was dead and draws had killed it."
+      },
+      {
+        "type": "paragraph",
+        "text": "The next generation of grandmasters responded by searching for moves that were not strictly optimal but were difficult for other humans to solve."
+      }
+    ]
+  }
+}

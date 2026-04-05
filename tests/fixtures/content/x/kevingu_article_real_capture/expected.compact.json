@@ -1,0 +1,13 @@
+{
+  "kind": "article",
+  "blocks": [
+    {
+      "t": "p",
+      "x": "today we're releasing AutoAgent, an open source library for autonomously improving an agent on any domain."
+    },
+    {
+      "t": "p",
+      "x": "AutoAgent hit both the #1 on SpreadsheetBench (96.5%) and the #1 GPT-5 score on TerminalBench"
+    }
+  ]
+}

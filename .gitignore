@@ -1,3 +1,6 @@
 /tmp/
 /target
 .env
+.env.production
+/services/content-renderer/.env.production
+services/content-renderer/node_modules/
