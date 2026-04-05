@@ -24,6 +24,7 @@ export function deriveParserRecoveryDecision(
 ): ParserRecoveryDecision {
   const diagnostics = processed.parserDiagnostics;
   const qualityScore = deriveParserQualityScore(diagnostics);
+  const isTextDocumentRoute = diagnostics?.route === "text-document";
 
   if (isRecoveryDisabledHost(processed.host)) {
     return {
@@ -61,10 +62,22 @@ export function deriveParserRecoveryDecision(
   }
 
   if (processed.sourceKind === "article") {
-    if (processed.wordCount < 80 || processed.blockCount === 0) {
+    if (
+      (
+        isTextDocumentRoute
+          ? processed.wordCount < 20
+          : processed.wordCount < 80
+      ) || processed.blockCount === 0
+    ) {
       reasons.add("article-empty-or-too-short");
       highPriority = true;
-    } else if (processed.wordCount < 220 && processed.blockCount < 3) {
+    } else if (
+      (
+        isTextDocumentRoute
+          ? processed.wordCount < 60
+          : processed.wordCount < 220
+      ) && processed.blockCount < (isTextDocumentRoute ? 2 : 3)
+    ) {
       reasons.add("article-too-few-blocks");
       highPriority = true;
     }

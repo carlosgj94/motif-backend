@@ -21,6 +21,7 @@ const CASES = [
   ["generic", "xataka_descartes"],
   ["generic", "juar_motif_crafted_for_motion"],
   ["generic", "jazzsequence_cms_is_dead"],
+  ["text", "karpathy_llm_wiki_gist"],
   ["live_blog", "guardian_cop30"],
   ["substack", "one_useful_thing_shape_of_the_thing"],
   ["bloomberg", "ai_perfected_chess"],

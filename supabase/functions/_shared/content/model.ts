@@ -160,6 +160,7 @@ export interface FetchDocumentResult {
   resolvedUrl: string;
   host: string;
   html: string;
+  contentType?: string | null;
   status: number;
   fetchedAt: string;
   originalUrl: string | null;

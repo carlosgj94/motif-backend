@@ -732,6 +732,28 @@ Deno.test("fetchDocument sends conditional headers and handles 304 not modified"
   });
 });
 
+Deno.test("fetchDocument accepts markdown text responses for supported text documents", async () => {
+  const result = await fetchDocument("https://example.com/notes/example.md", {
+    resolveDns: async () => ["93.184.216.34"],
+    fetchImpl: async () =>
+      new Response("# Example\n\nHello from markdown.", {
+        status: 200,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+        },
+      }),
+  });
+
+  assertObjectMatch(result as unknown as { [key: string]: unknown }, {
+    resolvedUrl: "https://example.com/notes/example.md",
+    host: "example.com",
+    contentType: "text/plain; charset=utf-8",
+    status: 200,
+    notModified: false,
+  });
+  assertEquals(result.html.includes("Hello from markdown."), true);
+});
+
 Deno.test("sanitizeParsedBlocks clamps oversized content", () => {
   const blocks = sanitizeParsedBlocks([
     { type: "paragraph", text: "x".repeat(5000) },

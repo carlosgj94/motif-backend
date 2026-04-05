@@ -12,8 +12,8 @@ monolith.
 - `model.ts` Canonical parser types and `ProcessingFailure`.
 - `detect.ts` Lightweight route detection from fetched document context.
 - `fetch.ts` Safe network access, redirect validation, archive mirror fallback,
-  byte-limited reads, and conditional HTML revalidation with `ETag` and
-  `Last-Modified`.
+  byte-limited reads, supported text-document ingestion, and conditional
+  revalidation with `ETag` and `Last-Modified`.
 - `normalize.ts` Pure DOM and metadata helpers. This is where generic
   normalization logic belongs.
 - `generic_article_heuristics.ts` Multi-candidate generic extraction, cleanup,
@@ -60,6 +60,8 @@ monolith.
   threads, and long-form single-post content.
 - `x_syndication.ts` Normalization of official public X syndication payloads
   into parser-friendly post and article signals.
+- `text_document_heuristics.ts` Markdown and plain-text parsing for raw text
+  sources such as GitHub raw files and gists.
 - `registry.ts` Maps a detected route to an adapter.
 - `adapters/*.ts` Provider or route specific extraction logic that returns
   `ProcessedContent`.
@@ -166,6 +168,9 @@ Adapters should not:
   scripts or remote enrichment.
 - Add to `x_syndication.ts` when official public X payload formats change and
   need a normalized mapping layer.
+- Add to `text_document_heuristics.ts` for raw markdown or plain-text parsing
+  rules, especially when new text-first sources should stay device-friendly
+  without being forced through HTML extraction.
 - Keep `content_processor.ts` thin. It is a compatibility facade and
   orchestration layer, not the place for new extraction heuristics.
 - Keep `If-None-Match` / `If-Modified-Since` handling centralized in `fetch.ts`.

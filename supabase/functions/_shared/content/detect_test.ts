@@ -1,8 +1,10 @@
 import {
   detectContentRoute,
   isSubstackHost,
+  isTextDocumentContentType,
   looksLikeLiveBlogHtml,
   looksLikeSubstackHtml,
+  looksLikeTextDocumentUrl,
 } from "./detect.ts";
 
 function assertEquals<T>(actual: T, expected: T): void {
@@ -76,5 +78,25 @@ Deno.test("looksLikeLiveBlogHtml detects live-blog pages before generic article 
       html,
     }),
     "live-blog",
+  );
+});
+
+Deno.test("text document detection recognizes markdown-like responses", () => {
+  assertEquals(isTextDocumentContentType("text/plain; charset=utf-8"), true);
+  assertEquals(
+    looksLikeTextDocumentUrl(
+      "https://gist.githubusercontent.com/user/id/raw/hash/example.md",
+    ),
+    true,
+  );
+  assertEquals(
+    detectContentRoute({
+      host: "gist.githubusercontent.com",
+      resolvedUrl:
+        "https://gist.githubusercontent.com/user/id/raw/hash/example.md",
+      contentType: "text/plain; charset=utf-8",
+      html: "# Example\n\nHello.",
+    }),
+    "text-document",
   );
 });

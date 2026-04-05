@@ -318,6 +318,7 @@ mod tests {
                 SourceKind::Article,
             ),
             ("generic", "jazzsequence_cms_is_dead", SourceKind::Article),
+            ("text", "karpathy_llm_wiki_gist", SourceKind::Article),
             ("live_blog", "guardian_cop30", SourceKind::Article),
             (
                 "substack",

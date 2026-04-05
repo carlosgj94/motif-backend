@@ -11,6 +11,7 @@ export interface ContentFixtureContext {
   status: number;
   fetchedAt: string;
   originalUrl: string | null;
+  contentType?: string | null;
 }
 
 export interface LoadedContentFixture {
@@ -137,6 +138,7 @@ export function buildFetchedDocumentResult(
     resolvedUrl: fixture.context.resolvedUrl,
     host: new URL(fixture.context.resolvedUrl).hostname.toLowerCase(),
     html: fixture.html,
+    contentType: fixture.context.contentType ?? "text/html; charset=utf-8",
     status: fixture.context.status,
     fetchedAt: fixture.context.fetchedAt,
     originalUrl: fixture.context.originalUrl,

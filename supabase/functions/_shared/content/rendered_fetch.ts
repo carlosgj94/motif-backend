@@ -119,6 +119,7 @@ export async function fetchRenderedDocument(
     resolvedUrl,
     host,
     html,
+    contentType: "text/html; charset=utf-8",
     status: normalizeStatus(payload.status) ?? 200,
     fetchedAt: new Date().toISOString(),
     originalUrl: normalizeUrlString(payload.originalUrl),

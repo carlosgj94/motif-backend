@@ -2,6 +2,7 @@ import { archiveHosts } from "./config.ts";
 import type { FetchDocumentResult } from "./model.ts";
 
 export type ContentRouteId =
+  | "text-document"
   | "generic-article"
   | "archive-snapshot"
   | "x-thread"
@@ -54,9 +55,62 @@ export function looksLikeLiveBlogHtml(html: string): boolean {
     /["']tone\/minutebyminute["']/i.test(html);
 }
 
+export function normalizeMimeType(
+  contentType: string | null | undefined,
+): string | null {
+  if (!contentType) {
+    return null;
+  }
+
+  const trimmed = contentType.trim().toLowerCase();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed.split(";", 1)[0]?.trim() || null;
+}
+
+export function isTextDocumentContentType(
+  contentType: string | null | undefined,
+): boolean {
+  const mimeType = normalizeMimeType(contentType);
+  return mimeType === "text/plain" ||
+    mimeType === "text/markdown" ||
+    mimeType === "text/x-markdown" ||
+    mimeType === "application/markdown" ||
+    mimeType === "application/x-markdown";
+}
+
+export function looksLikeTextDocumentUrl(
+  url: string | null | undefined,
+): boolean {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    return /\.(md|markdown|txt|text|rst)$/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
 export function detectContentRoute(
-  fetched: Pick<FetchDocumentResult, "host" | "html">,
+  fetched: Pick<FetchDocumentResult, "host" | "html"> & {
+    contentType?: string | null;
+    resolvedUrl?: string | null;
+  },
 ): ContentRouteId {
+  if (
+    isTextDocumentContentType(fetched.contentType) ||
+    (
+      !normalizeMimeType(fetched.contentType) &&
+      looksLikeTextDocumentUrl(fetched.resolvedUrl)
+    )
+  ) {
+    return "text-document";
+  }
   if (isXHost(fetched.host)) {
     return "x-thread";
   }

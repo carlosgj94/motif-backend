@@ -10,7 +10,9 @@ Fixtures exist to make parser changes reviewable and regression-tested.
 Each fixture represents one fetched page and the reviewed outputs derived from
 it:
 
-- `raw.html`: the fetched HTML body
+- `raw.html`: the fetched response body. Most fixtures store HTML, but text
+  routes may store raw markdown or plain text in this file to keep the replay
+  contract consistent across providers.
 - `headers.json`: stable fetch context used to replay parsing
 - `expected.parsed.json`: reviewed parser output subset
 - `expected.compact.json`: reviewed compact device output
@@ -46,6 +48,7 @@ example:
 - `archive`
 - `x`
 - `substack`
+- `text`
 
 Archive fixtures may represent either:
 
@@ -105,7 +108,8 @@ When replacing a seed fixture with a captured page:
   "resolvedUrl": "https://example.com/posts/example",
   "status": 200,
   "fetchedAt": "2026-04-05T00:00:00.000Z",
-  "originalUrl": null
+  "originalUrl": null,
+  "contentType": "text/html; charset=utf-8"
 }
 ```
 

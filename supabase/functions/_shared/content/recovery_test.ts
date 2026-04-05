@@ -139,3 +139,44 @@ Deno.test("deriveParserRecoveryDecision skips disabled recovery hosts", () => {
     throw new Error("disabled recovery host should not keep recovery reasons");
   }
 });
+
+Deno.test("deriveParserRecoveryDecision treats healthy text documents as complete", () => {
+  const decision = deriveParserRecoveryDecision({
+    host: "gist.githubusercontent.com",
+    sourceKind: "article",
+    title: "Short note",
+    blockCount: 2,
+    wordCount: 34,
+    parserDiagnostics: {
+      route: "text-document",
+      parserName: "text-document",
+      parserVersion: "1",
+      selectedStrategyId: "markdown-text",
+      bytes: {
+        parsedDocumentBytes: 900,
+        parsedDocumentBudgetBytes: 256 * 1024,
+        parsedDocumentBudgetRatio: 0.01,
+        compactBodyBytes: 600,
+        compactBodyBudgetBytes: 32 * 1024,
+        compactBodyBudgetRatio: 0.02,
+      },
+      warnings: [],
+      candidates: [{
+        id: "markdown-text",
+        selected: true,
+        qualityScore: 62,
+        totalScore: 62,
+        blockCount: 2,
+        wordCount: 34,
+        imageCount: 0,
+        compactBodyBytes: 600,
+        parsedDocumentBytes: 900,
+        notes: [],
+      }],
+    },
+  });
+
+  if (decision.shouldRecover) {
+    throw new Error("healthy text document should skip recovery");
+  }
+});

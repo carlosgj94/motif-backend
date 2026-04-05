@@ -8,12 +8,16 @@ import {
 import { isArchiveHost } from "./detect.ts";
 import {
   type DnsRecordType,
-  type FetchImpl,
   type FetchDocumentResult,
+  type FetchImpl,
   type NetworkPolicy,
   ProcessingFailure,
   type ResolveDnsFn,
 } from "./model.ts";
+import {
+  isTextDocumentContentType,
+  looksLikeTextDocumentUrl,
+} from "./detect.ts";
 
 const DNS_OVER_HTTPS_URL = "https://cloudflare-dns.com/dns-query";
 
@@ -70,6 +74,7 @@ export async function fetchDocument(
           resolvedUrl,
           host: resolvedHost,
           html: "",
+          contentType: response.headers.get("content-type"),
           status: response.status,
           fetchedAt: new Date().toISOString(),
           originalUrl: extractOriginalUrlFromLinkHeaderValue(
@@ -91,11 +96,15 @@ export async function fetchDocument(
         );
       }
 
-      const contentType = response.headers.get("content-type")?.toLowerCase() ??
-        "";
-      if (!contentType.includes("html")) {
+      const contentType = response.headers.get("content-type");
+      const acceptsTextDocument = isTextDocumentContentType(contentType) ||
+        (!contentType && looksLikeTextDocumentUrl(resolvedUrl));
+      if (
+        !contentType?.toLowerCase().includes("html") &&
+        !acceptsTextDocument
+      ) {
         throw ProcessingFailure.fetch(
-          "Source URL did not return HTML content",
+          "Source URL did not return supported HTML or text content",
           {
             httpStatus: response.status,
             retryable: false,
@@ -113,6 +122,7 @@ export async function fetchDocument(
         resolvedUrl,
         host: resolvedHost,
         html,
+        contentType,
         status: response.status,
         fetchedAt: new Date().toISOString(),
         originalUrl: extractOriginalUrlFromLinkHeaderValue(
