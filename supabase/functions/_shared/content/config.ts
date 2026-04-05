@@ -16,6 +16,22 @@ function envNumber(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function envCsvList(name: string): string[] {
+  const raw = safeEnvGet(name);
+  if (!raw) {
+    return [];
+  }
+
+  return raw
+    .split(",")
+    .map((value) => normalizeHostValue(value))
+    .filter(Boolean);
+}
+
+function normalizeHostValue(value: string): string {
+  return value.trim().toLowerCase().replace(/\.+$/, "");
+}
+
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_REDIRECTS = 5;
 const DEFAULT_MAX_HTML_BYTES = 2 * 1024 * 1024;
@@ -31,6 +47,9 @@ const DEFAULT_MAX_COMPACT_BODY_BYTES = 32 * 1024;
 const DEFAULT_MAX_PARSER_DIAGNOSTICS_BYTES = 16 * 1024;
 const DEFAULT_RENDERED_FETCH_TIMEOUT_MS = 30_000;
 const DEFAULT_RENDERED_RESPONSE_BYTES = 3 * 1024 * 1024;
+const DEFAULT_RECOVERY_DISABLED_HOSTS = [
+  "thinkingbasketball.net",
+];
 
 export const USER_AGENT = "motif-content-processor/0.1";
 export const PARSER_VERSION = "1";
@@ -95,6 +114,11 @@ export const noisyArticleTags = new Set([
   "svg",
   "textarea",
 ]);
+export const recoveryDisabledHosts: ReadonlySet<string> = new Set(
+  [...DEFAULT_RECOVERY_DISABLED_HOSTS, ...envCsvList("CONTENT_RECOVERY_DISABLED_HOSTS")]
+    .map((value) => normalizeHostValue(value))
+    .filter(Boolean),
+);
 
 export const httpTimeoutMs = envNumber(
   "CONTENT_PROCESSING_HTTP_TIMEOUT_MS",
@@ -157,4 +181,25 @@ export const maxRenderedResponseBytes = envNumber(
   DEFAULT_RENDERED_RESPONSE_BYTES,
 );
 
-export { envNumber, safeEnvGet };
+export function isRecoveryDisabledHost(host: string | null | undefined): boolean {
+  if (!host) {
+    return false;
+  }
+
+  const normalized = normalizeHostValue(host);
+  if (!normalized) {
+    return false;
+  }
+
+  if (recoveryDisabledHosts.has(normalized)) {
+    return true;
+  }
+
+  if (normalized.startsWith("www.")) {
+    return recoveryDisabledHosts.has(normalized.slice(4));
+  }
+
+  return false;
+}
+
+export { envCsvList, envNumber, safeEnvGet };

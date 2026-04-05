@@ -4,6 +4,7 @@ import type {
   ProcessedContent,
 } from "./model.ts";
 import { deriveParserQualityScore } from "./diagnostics.ts";
+import { isRecoveryDisabledHost } from "./config.ts";
 
 const MAX_STORED_RECOVERY_REASONS = 8;
 const ARTICLE_HIGH_PRIORITY_QUALITY_SCORE = 10;
@@ -13,11 +14,28 @@ const POST_LOW_PRIORITY_QUALITY_SCORE = 8;
 export function deriveParserRecoveryDecision(
   processed: Pick<
     ProcessedContent,
-    "sourceKind" | "title" | "blockCount" | "wordCount" | "parserDiagnostics"
+    | "host"
+    | "sourceKind"
+    | "title"
+    | "blockCount"
+    | "wordCount"
+    | "parserDiagnostics"
   >,
 ): ParserRecoveryDecision {
   const diagnostics = processed.parserDiagnostics;
   const qualityScore = deriveParserQualityScore(diagnostics);
+
+  if (isRecoveryDisabledHost(processed.host)) {
+    return {
+      shouldRecover: false,
+      priority: null,
+      qualityScore,
+      route: diagnostics?.route ?? null,
+      selectedStrategyId: diagnostics?.selectedStrategyId ?? null,
+      reasons: [],
+    };
+  }
+
   const reasons = new Set<string>();
   let highPriority = false;
 

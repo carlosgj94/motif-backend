@@ -5,6 +5,7 @@ import {
 
 Deno.test("deriveParserRecoveryDecision flags weak article parses", () => {
   const decision = deriveParserRecoveryDecision({
+    host: "example.com",
     sourceKind: "article",
     title: "Example",
     blockCount: 2,
@@ -53,6 +54,7 @@ Deno.test("deriveParserRecoveryDecision flags weak article parses", () => {
 
 Deno.test("deriveParserRecoveryDecision ignores healthy parses", () => {
   const decision = deriveParserRecoveryDecision({
+    host: "example.com",
     sourceKind: "article",
     title: "Example",
     blockCount: 8,
@@ -91,5 +93,49 @@ Deno.test("deriveParserRecoveryDecision ignores healthy parses", () => {
   }
   if (prepareParserRecoveryForStorage(decision) !== null) {
     throw new Error("healthy parse should not persist recovery payload");
+  }
+});
+
+Deno.test("deriveParserRecoveryDecision skips disabled recovery hosts", () => {
+  const decision = deriveParserRecoveryDecision({
+    host: "thinkingbasketball.net",
+    sourceKind: "article",
+    title: "Example",
+    blockCount: 0,
+    wordCount: 0,
+    parserDiagnostics: {
+      route: "generic-article",
+      parserName: "generic-article",
+      parserVersion: "1",
+      selectedStrategyId: "readability",
+      bytes: {
+        parsedDocumentBytes: 256,
+        parsedDocumentBudgetBytes: 256 * 1024,
+        parsedDocumentBudgetRatio: 0.001,
+        compactBodyBytes: 128,
+        compactBodyBudgetBytes: 32 * 1024,
+        compactBodyBudgetRatio: 0.004,
+      },
+      warnings: [],
+      candidates: [{
+        id: "readability",
+        selected: true,
+        qualityScore: 0,
+        totalScore: 0,
+        blockCount: 0,
+        wordCount: 0,
+        imageCount: 0,
+        compactBodyBytes: 128,
+        parsedDocumentBytes: 256,
+        notes: [],
+      }],
+    },
+  });
+
+  if (decision.shouldRecover) {
+    throw new Error("disabled recovery host should skip recovery");
+  }
+  if (decision.reasons.length !== 0) {
+    throw new Error("disabled recovery host should not keep recovery reasons");
   }
 });

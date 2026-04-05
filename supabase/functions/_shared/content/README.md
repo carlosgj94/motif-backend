@@ -278,6 +278,11 @@ Current lifecycle:
    - `failed` when the active recovery stage hit an operational failure and
      should retry later
 
+Recovery is not universal. Host-level exclusions can skip the recovery queues
+entirely through `CONTENT_RECOVERY_DISABLED_HOSTS`, and the current default
+exclusion set includes `thinkingbasketball.net` so it does not keep consuming
+recovery capacity.
+
 This separation is intentional. It lets a future rendered fallback worker plug
 into the same recovery queue and status model instead of reworking parser
 storage again.
