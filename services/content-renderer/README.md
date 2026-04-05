@@ -240,6 +240,9 @@ curl -sS http://127.0.0.1:8788/render \
 
 - Keep this service private to backend infrastructure.
 - Do not add stealth or ban-evasion logic here.
+- Keep the Docker base image and the `playwright` package pinned to the same
+  exact version. Do not use a caret range here, or the service can boot while
+  Chromium is missing at runtime.
 - The request policy intentionally blocks images, fonts, media, and common
   analytics hosts to reduce cost and shrink rendered noise.
 - If a host needs special handling, prefer adjusting parser recovery routing

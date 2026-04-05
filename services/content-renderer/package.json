@@ -9,6 +9,6 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "playwright": "^1.53.1"
+    "playwright": "1.59.1"
   }
 }

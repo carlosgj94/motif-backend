@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.53.1-noble
+FROM mcr.microsoft.com/playwright:v1.59.1-noble
 
 ENV NODE_ENV=production
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
