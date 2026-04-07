@@ -54,6 +54,8 @@ Copy `.env.example` to `.env` and set:
 - `POST /recommendations/sources/preview`: get pre-auth source recommendations for onboarding topic or subtopic selections
 - `GET /me`: returns the verified Supabase user plus any claimed app profile
 - `PUT /me/profile`: create or update the authenticated user's app profile
+- `GET /me/recommendations/subtopics`: list the authenticated user's leaf subtopics from preferences plus positive affinity
+- `GET /me/recommendations/content/by-topic/:topic_slug`: get authenticated content recommendations filtered to one exact topic slug
 - `GET /profiles/:username`: fetch a public profile by username
 
 ## Expected client flow
@@ -86,6 +88,8 @@ Supabase handles the actual password policy enforcement and secure password chan
 - `GET /recommendations/topics` now returns a nested topic tree.
 - Both parent topics and subtopics are valid `topic_slugs` inputs for onboarding preview and saved preferences.
 - Parent topic selections expand to matching subtopics for source recommendation preview and downstream recommendation affinity.
+- `GET /me/recommendations/subtopics` returns only leaf subtopics.
+- Authenticated subtopics combine saved settings and positive behavior-derived topic affinity.
 
 To seed curated `source_topics` and backfill `content_topics` in development:
 

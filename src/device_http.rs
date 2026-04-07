@@ -41,6 +41,14 @@ pub fn router() -> Router<AppState> {
             "/me/recommendations/content",
             get(list_content_recommendations),
         )
+        .route(
+            "/me/recommendations/content/by-topic/{topic_slug}",
+            get(list_content_recommendations_by_topic),
+        )
+        .route(
+            "/me/recommendations/subtopics",
+            get(list_recommendation_subtopics),
+        )
         .route("/me/content/{content_id}", get(get_content_detail))
         .route("/me/content/{content_id}/package", get(get_content_package))
         .fallback(device_not_found)
@@ -146,6 +154,31 @@ async fn get_content_package(
     DevicePath(content_id): DevicePath<Uuid>,
 ) -> Result<Response, ApiError> {
     recommendations::get_content_package(user, State(state), Path(content_id)).await
+}
+
+async fn list_content_recommendations_by_topic(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(topic_slug): DevicePath<String>,
+    DeviceQuery(query): DeviceQuery<recommendations::ListRecommendationsQuery>,
+) -> Result<DeviceJson<recommendations::ContentRecommendationListResponse>, ApiError> {
+    recommendations::list_content_recommendations_by_topic(
+        user,
+        State(state),
+        Path(topic_slug),
+        Query(query),
+    )
+    .await
+    .map(map_json)
+}
+
+async fn list_recommendation_subtopics(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<DeviceJson<recommendations::RecommendationSubtopicListResponse>, ApiError> {
+    recommendations::list_user_recommendation_subtopics(user, State(state))
+        .await
+        .map(map_json)
 }
 
 async fn device_not_found() -> ApiError {
@@ -265,12 +298,15 @@ fn map_path_rejection(rejection: PathRejection) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{auth::SupabaseAuth, auth_api::SupabaseAuthApi, config::SupabaseConfig, rate_limit::AuthRateLimiter};
     use axum::{
         http::{Method, Request},
         routing::get,
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
     use tower::util::ServiceExt;
 
     #[derive(Deserialize)]
@@ -309,6 +345,26 @@ mod tests {
             )
             .fallback(device_not_found)
             .method_not_allowed_fallback(device_method_not_allowed)
+    }
+
+    fn test_state() -> AppState {
+        let config = SupabaseConfig {
+            url: "http://127.0.0.1:9999".to_string(),
+            issuer: "http://127.0.0.1:9999/auth/v1".to_string(),
+            jwks_url: "http://127.0.0.1:9999/auth/v1/.well-known/jwks.json".to_string(),
+            audience: "authenticated".to_string(),
+            jwks_cache_ttl: Duration::from_secs(300),
+            publishable_key: Some("publishable-test-key".to_string()),
+        };
+
+        AppState {
+            auth: SupabaseAuth::new(config.clone()),
+            auth_api: SupabaseAuthApi::new(&config),
+            auth_rate_limiter: AuthRateLimiter::default(),
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgresql://postgres:postgres@localhost/postgres")
+                .expect("lazy pool should parse"),
+        }
     }
 
     #[tokio::test]
@@ -544,5 +600,33 @@ mod tests {
             String::from_utf8(second_body.to_vec()).unwrap(),
             expected_ok
         );
+    }
+
+    #[tokio::test]
+    async fn recommendation_topic_routes_exist_and_require_auth() {
+        let app = router().with_state(test_state());
+
+        let subtopics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/me/recommendations/subtopics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subtopics.status(), StatusCode::UNAUTHORIZED);
+
+        let filtered = app
+            .oneshot(
+                Request::builder()
+                    .uri("/me/recommendations/content/by-topic/programming")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.status(), StatusCode::UNAUTHORIZED);
     }
 }

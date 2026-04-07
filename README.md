@@ -82,7 +82,9 @@ Use this flow if you do not want the Supabase `service_role` key in the backend:
 ### Recommendations
 
 - `GET /me/recommendations/content`
+- `GET /me/recommendations/content/by-topic/{topic_slug}`
 - `GET /me/recommendations/sources`
+- `GET /me/recommendations/subtopics`
 - `GET /me/recommendation-preferences`
 - `PUT /me/recommendation-preferences`
 - `POST /me/interaction-events/batch`
@@ -673,6 +675,53 @@ Example shape:
 }
 ```
 
+#### `GET /me/recommendations/subtopics`
+
+Return the user’s leaf subtopics for device browse UI. The list combines saved recommendation preferences and positive behavior-derived affinity.
+
+Example:
+
+```bash
+curl -sS "$API/me/recommendations/subtopics" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
+Example shape:
+
+```json
+{
+  "subtopics": [
+    {
+      "id": "topic-id",
+      "slug": "programming",
+      "label": "Programming",
+      "parent_topic_slug": "technology",
+      "parent_topic_label": "Technology",
+      "affinity_score": 3.42,
+      "is_from_settings": true,
+      "is_from_behavior": true
+    }
+  ]
+}
+```
+
+#### `GET /me/recommendations/content/by-topic/{topic_slug}`
+
+Return the same content recommendation payload as `GET /me/recommendations/content`, filtered to content or sources tagged with the exact topic slug requested.
+
+Query parameters:
+
+- `limit`
+
+Example:
+
+```bash
+curl -sS "$API/me/recommendations/content/by-topic/programming?limit=10" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq
+```
+
 #### `GET /me/recommendations/sources`
 
 Return ranked source suggestions plus a `serve_id`.
@@ -772,10 +821,15 @@ Event fields:
 - `client_event_id` is required
 - `heartbeat` requires `visible_ms_delta`
 - `surface`, `session_id`, `serve_id`, `position`, `occurred_at`, and `metadata` are optional
+- Use `recommendations_content_topic` as the `surface` value for telemetry emitted from `GET /me/recommendations/content/by-topic/{topic_slug}` or `/device/v1/me/recommendations/content/by-topic/{topic_slug}`.
 
 ## Notes For Device Clients
 
 - Use list endpoints for summary views and detail endpoints only when the user opens one item.
+- Topic browse endpoints are also available on the device surface:
+  - `GET /device/v1/me/recommendations/subtopics`
+  - `GET /device/v1/me/recommendations/content/by-topic/{topic_slug}`
+  - `GET /device/v1/me/recommendations/content`
 - The compact body contract is intentionally minimal:
   - heading: `{ "t": "h", "l": 2, "x": "Heading" }`
   - paragraph: `{ "t": "p", "x": "Paragraph text" }`

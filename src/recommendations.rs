@@ -76,6 +76,56 @@ pub async fn list_content_recommendations(
     let candidate_rows =
         fetch_content_recommendation_candidate_rows(&state.pool, user.user_id).await?;
 
+    let response = build_content_recommendation_response(
+        &state.pool,
+        user.user_id,
+        limit,
+        user_context,
+        candidate_rows,
+        None,
+    )
+    .await?;
+
+    Ok(Json(response))
+}
+
+pub async fn list_content_recommendations_by_topic(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(topic_slug): Path<String>,
+    Query(query): Query<ListRecommendationsQuery>,
+) -> ApiResult<Json<ContentRecommendationListResponse>> {
+    let limit = normalize_recommendation_limit(query.limit)?;
+    let topic_slug = normalize_single_topic_slug(&topic_slug)?;
+    let topic = fetch_topic_by_slug(&state.pool, &topic_slug)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Topic was not found"))?;
+    let user_context = load_user_recommendation_context(&state.pool, user.user_id).await?;
+    let candidate_rows =
+        fetch_content_recommendation_candidate_rows_for_topic(&state.pool, user.user_id, topic.id)
+            .await?;
+
+    let response = build_content_recommendation_response(
+        &state.pool,
+        user.user_id,
+        limit,
+        user_context,
+        candidate_rows,
+        Some(&topic_slug),
+    )
+    .await?;
+
+    Ok(Json(response))
+}
+
+async fn build_content_recommendation_response(
+    pool: &PgPool,
+    user_id: Uuid,
+    limit: u32,
+    user_context: UserRecommendationContext,
+    candidate_rows: Vec<RecommendationContentCandidateRow>,
+    topic_slug: Option<&str>,
+) -> ApiResult<ContentRecommendationListResponse> {
     let mut scored = candidate_rows
         .into_iter()
         .filter_map(|row| {
@@ -145,11 +195,12 @@ pub async fn list_content_recommendations(
     scored.sort_by(|left, right| right.score.total_cmp(&left.score));
     let selected = apply_content_diversity(scored, limit as usize);
     let serve_id = persist_content_recommendation_serve(
-        &state.pool,
-        user.user_id,
+        pool,
+        user_id,
         limit,
         &selected,
         user_context.preferred_languages.clone(),
+        topic_slug,
     )
     .await?;
 
@@ -161,10 +212,10 @@ pub async fn list_content_recommendations(
         })
         .collect::<ApiResult<Vec<_>>>()?;
 
-    Ok(Json(ContentRecommendationListResponse {
+    Ok(ContentRecommendationListResponse {
         serve_id,
         content,
-    }))
+    })
 }
 
 pub async fn list_source_recommendations(
@@ -292,6 +343,19 @@ pub async fn preview_source_recommendations(
         .collect::<ApiResult<Vec<_>>>()?;
 
     Ok(Json(PublicSourceRecommendationListResponse { sources }))
+}
+
+pub async fn list_user_recommendation_subtopics(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<RecommendationSubtopicListResponse>> {
+    let subtopics = fetch_user_recommendation_subtopic_rows(&state.pool, user.user_id)
+        .await?
+        .into_iter()
+        .map(build_recommendation_subtopic)
+        .collect();
+
+    Ok(Json(RecommendationSubtopicListResponse { subtopics }))
 }
 
 pub async fn get_content_detail(
@@ -711,6 +775,24 @@ async fn fetch_content_recommendation_candidate_rows(
     .map_err(map_recommendation_error)
 }
 
+async fn fetch_content_recommendation_candidate_rows_for_topic(
+    pool: &PgPool,
+    user_id: Uuid,
+    topic_id: Uuid,
+) -> ApiResult<Vec<RecommendationContentCandidateRow>> {
+    sqlx::query_as::<_, RecommendationContentCandidateRow>(
+        r#"
+        select *
+        from public.get_content_recommendation_candidates_for_topic($1, $2)
+        "#,
+    )
+    .bind(user_id)
+    .bind(topic_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_recommendation_error)
+}
+
 async fn fetch_source_recommendation_candidate_rows(
     pool: &PgPool,
     user_id: Uuid,
@@ -745,14 +827,38 @@ async fn fetch_public_source_recommendation_candidate_rows(
     .map_err(map_recommendation_error)
 }
 
+async fn fetch_user_recommendation_subtopic_rows(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> ApiResult<Vec<RecommendationSubtopicRow>> {
+    sqlx::query_as::<_, RecommendationSubtopicRow>(
+        r#"
+        select *
+        from public.get_user_recommendation_subtopics($1)
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_recommendation_error)
+}
+
 async fn persist_content_recommendation_serve(
     pool: &PgPool,
     user_id: Uuid,
     limit: u32,
     candidates: &[ScoredContentCandidate],
     preferred_languages: Vec<String>,
+    topic_slug: Option<&str>,
 ) -> ApiResult<Uuid> {
     let mut transaction = pool.begin().await.map_err(map_recommendation_error)?;
+    let mut request_context = json!({
+        "limit": limit,
+        "preferred_languages": preferred_languages,
+    });
+    if let Some(topic_slug) = topic_slug {
+        request_context["topic_slug"] = Value::String(topic_slug.to_string());
+    }
     let serve_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         insert into public.recommendation_serves (
@@ -761,22 +867,13 @@ async fn persist_content_recommendation_serve(
             algorithm_version,
             request_context
         )
-        values (
-            $1,
-            'content',
-            $2,
-            jsonb_build_object(
-                'limit', $3,
-                'preferred_languages', $4
-            )
-        )
+        values ($1, 'content', $2, $3)
         returning id
         "#,
     )
     .bind(user_id)
     .bind(RECOMMENDATION_ALGORITHM_VERSION)
-    .bind(i64::from(limit))
-    .bind(&preferred_languages)
+    .bind(SqlxJson(request_context))
     .fetch_one(&mut *transaction)
     .await
     .map_err(map_recommendation_error)?;
@@ -965,6 +1062,20 @@ fn build_recommendation_topic(
         label: row.label,
         description: row.description,
         subtopics,
+    }
+}
+
+fn build_recommendation_subtopic(row: RecommendationSubtopicRow) -> RecommendationSubtopic {
+    RecommendationSubtopic {
+        id: row.id,
+        slug: row.slug,
+        label: row.label,
+        description: row.description,
+        parent_topic_slug: row.parent_topic_slug,
+        parent_topic_label: row.parent_topic_label,
+        affinity_score: row.affinity_score,
+        is_from_settings: row.is_from_settings,
+        is_from_behavior: row.is_from_behavior,
     }
 }
 
@@ -1174,6 +1285,20 @@ async fn fetch_topics_by_slugs(pool: &PgPool, slugs: &[String]) -> ApiResult<Vec
     .map_err(map_recommendation_error)
 }
 
+async fn fetch_topic_by_slug(pool: &PgPool, slug: &str) -> ApiResult<Option<TopicRow>> {
+    sqlx::query_as::<_, TopicRow>(
+        r#"
+        select id
+        from public.topics
+        where slug = $1
+        "#,
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_recommendation_error)
+}
+
 fn apply_content_diversity(
     ranked: Vec<ScoredContentCandidate>,
     limit: usize,
@@ -1343,6 +1468,10 @@ fn normalize_topic_slugs(input: &[String]) -> ApiResult<Vec<String>> {
     Ok(normalized)
 }
 
+fn normalize_single_topic_slug(input: &str) -> ApiResult<String> {
+    normalize_tag_slug(input)
+}
+
 fn normalize_language_codes(input: &[String]) -> ApiResult<Vec<String>> {
     if input.len() > MAX_LANGUAGE_PREFERENCES {
         return Err(ApiError::bad_request(
@@ -1480,6 +1609,11 @@ pub struct RecommendationTopicListResponse {
     topics: Vec<RecommendationTopic>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecommendationSubtopicListResponse {
+    subtopics: Vec<RecommendationSubtopic>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PublicSourceRecommendationsRequest {
     #[serde(default)]
@@ -1564,6 +1698,20 @@ pub struct RecommendationTopic {
     description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     subtopics: Vec<RecommendationTopic>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecommendationSubtopic {
+    id: Uuid,
+    slug: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    parent_topic_slug: String,
+    parent_topic_label: String,
+    affinity_score: f64,
+    is_from_settings: bool,
+    is_from_behavior: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1879,6 +2027,21 @@ struct TopicRow {
     id: Uuid,
 }
 
+#[derive(Debug, FromRow)]
+struct RecommendationSubtopicRow {
+    id: Uuid,
+    slug: String,
+    label: String,
+    description: Option<String>,
+    parent_topic_slug: String,
+    parent_topic_label: String,
+    affinity_score: f64,
+    #[sqlx(rename = "last_interacted_at")]
+    _last_interacted_at: Option<OffsetDateTime>,
+    is_from_settings: bool,
+    is_from_behavior: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedRecommendationPreferences {
     pub(crate) language_codes: Vec<String>,
@@ -1904,28 +2067,49 @@ struct RecommendationTopicRow {
 mod tests {
     use super::{
         ContentScoreInputs, PublicInteractionEventType, PublicSourcePreviewScoreInputs,
-        PublicSourceRecommendationsRequest, RecommendationSourceCandidateRow,
-        RecommendationTopicRow, SourceScoreInputs, build_recommendation_topic,
-        build_recommendation_topics, freshness_score, normalize_language_codes,
-        normalize_positive_score, normalize_topic_slugs, preview_source_recommendations,
-        score_content_recommendation, score_public_source_preview, score_source_recommendation,
+        PublicSourceRecommendationsRequest, RecommendationContentCandidateRow,
+        RecommendationSourceCandidateRow, RecommendationSubtopicListResponse,
+        RecommendationSubtopicRow, RecommendationTopicRow, SourceScoreInputs,
+        build_recommendation_topic, build_recommendation_topics, freshness_score,
+        list_content_recommendations_by_topic, list_user_recommendation_subtopics,
+        normalize_language_codes, normalize_positive_score, normalize_single_topic_slug,
+        normalize_topic_slugs, preview_source_recommendations, score_content_recommendation,
+        score_public_source_preview, score_source_recommendation,
         validate_public_interaction_event,
     };
     use crate::{
-        AppState, auth::SupabaseAuth, auth_api::SupabaseAuthApi, config::SupabaseConfig,
+        AppState,
+        auth::{AuthenticatedUser, SupabaseAuth},
+        auth_api::SupabaseAuthApi,
+        config::SupabaseConfig,
         rate_limit::AuthRateLimiter,
     };
     use axum::response::IntoResponse;
-    use axum::{Json, extract::State};
+    use axum::{
+        Json,
+        extract::{Path, Query, State},
+    };
     use serde_json::json;
     use sqlx::{PgPool, Postgres, Transaction, migrate::Migrator, postgres::PgPoolOptions};
-    use std::{env, time::Duration};
+    use std::{
+        env,
+        sync::{Mutex, OnceLock},
+        time::Duration,
+    };
     use time::OffsetDateTime;
     use uuid::Uuid;
 
     static TEST_MIGRATOR: Migrator = sqlx::migrate!();
 
     fn test_app_state() -> AppState {
+        test_app_state_with_pool(
+            PgPoolOptions::new()
+                .connect_lazy("postgresql://postgres:postgres@localhost/postgres")
+                .expect("lazy pool should parse"),
+        )
+    }
+
+    fn test_app_state_with_pool(pool: PgPool) -> AppState {
         let config = SupabaseConfig {
             url: "http://127.0.0.1:9999".to_string(),
             issuer: "http://127.0.0.1:9999/auth/v1".to_string(),
@@ -1939,9 +2123,7 @@ mod tests {
             auth: SupabaseAuth::new(config.clone()),
             auth_api: SupabaseAuthApi::new(&config),
             auth_rate_limiter: AuthRateLimiter::default(),
-            pool: PgPoolOptions::new()
-                .connect_lazy("postgresql://postgres:postgres@localhost/postgres")
-                .expect("lazy pool should parse"),
+            pool,
         }
     }
 
@@ -1962,6 +2144,14 @@ mod tests {
             .expect("database-backed recommendation tests should apply migrations");
 
         pool
+    }
+
+    fn lock_test_database() -> std::sync::MutexGuard<'static, ()> {
+        static DB_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        DB_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("database test mutex should lock")
     }
 
     fn unique_test_uuid(suffix: u128) -> Uuid {
@@ -2004,6 +2194,208 @@ mod tests {
         .expect("topic should insert");
     }
 
+    fn test_authenticated_user(user_id: Uuid) -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_id,
+            email: Some(format!("recommendation-test-{user_id}@example.com")),
+            role: "authenticated".to_string(),
+            aal: None,
+            session_id: None,
+            app_metadata: None,
+            user_metadata: None,
+        }
+    }
+
+    async fn insert_auth_user(transaction: &mut Transaction<'_, Postgres>, user_id: Uuid) {
+        let email = format!("recommendation-test-{user_id}@example.com");
+        sqlx::query(
+            r#"
+            insert into auth.users (
+                id,
+                aud,
+                role,
+                email,
+                encrypted_password,
+                email_confirmed_at,
+                raw_app_meta_data,
+                raw_user_meta_data,
+                created_at,
+                updated_at
+            )
+            values (
+                $1,
+                'authenticated',
+                'authenticated',
+                $2,
+                '',
+                timezone('utc', now()),
+                '{"provider":"email","providers":["email"]}'::jsonb,
+                '{}'::jsonb,
+                timezone('utc', now()),
+                timezone('utc', now())
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(email)
+        .execute(&mut **transaction)
+        .await
+        .expect("auth user should insert");
+    }
+
+    async fn insert_content_source(
+        transaction: &mut Transaction<'_, Postgres>,
+        source_id: Uuid,
+        source_url: &str,
+        host: &str,
+        title: &str,
+    ) {
+        sqlx::query(
+            r#"
+            insert into public.content_sources (
+                id,
+                source_url,
+                host,
+                title,
+                source_kind,
+                refresh_status
+            )
+            values ($1, $2, $3, $4, 'website', 'succeeded')
+            "#,
+        )
+        .bind(source_id)
+        .bind(source_url)
+        .bind(host)
+        .bind(title)
+        .execute(&mut **transaction)
+        .await
+        .expect("content source should insert");
+    }
+
+    async fn insert_content(
+        transaction: &mut Transaction<'_, Postgres>,
+        content_id: Uuid,
+        source_id: Uuid,
+        canonical_url: &str,
+        host: &str,
+        title: &str,
+    ) {
+        sqlx::query(
+            r#"
+            insert into public.content (
+                id,
+                source_id,
+                canonical_url,
+                host,
+                title,
+                language_code,
+                parsed_document,
+                fetch_status,
+                parse_status,
+                published_at
+            )
+            values (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                'en',
+                '{}'::jsonb,
+                'succeeded',
+                'succeeded',
+                timezone('utc', now())
+            )
+            "#,
+        )
+        .bind(content_id)
+        .bind(source_id)
+        .bind(canonical_url)
+        .bind(host)
+        .bind(title)
+        .execute(&mut **transaction)
+        .await
+        .expect("content should insert");
+    }
+
+    async fn insert_content_topic(
+        transaction: &mut Transaction<'_, Postgres>,
+        content_id: Uuid,
+        topic_id: Uuid,
+        confidence: f64,
+    ) {
+        sqlx::query(
+            r#"
+            insert into public.content_topics (content_id, topic_id, confidence)
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(content_id)
+        .bind(topic_id)
+        .bind(confidence)
+        .execute(&mut **transaction)
+        .await
+        .expect("content topic should insert");
+    }
+
+    async fn insert_source_topic(
+        transaction: &mut Transaction<'_, Postgres>,
+        source_id: Uuid,
+        topic_id: Uuid,
+        confidence: f64,
+    ) {
+        sqlx::query(
+            r#"
+            insert into public.source_topics (source_id, topic_id, confidence)
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(source_id)
+        .bind(topic_id)
+        .bind(confidence)
+        .execute(&mut **transaction)
+        .await
+        .expect("source topic should insert");
+    }
+
+    async fn insert_user_content_feedback(
+        transaction: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+        content_id: Uuid,
+        source_id: Uuid,
+        score: f64,
+    ) {
+        sqlx::query(
+            r#"
+            insert into public.user_content_feedback (
+                user_id,
+                content_id,
+                source_id,
+                impression_count,
+                open_count,
+                last_interacted_at,
+                score
+            )
+            values ($1, $2, $3, 1, 1, timezone('utc', now()), $4)
+            "#,
+        )
+        .bind(user_id)
+        .bind(content_id)
+        .bind(source_id)
+        .bind(score)
+        .execute(&mut **transaction)
+        .await
+        .expect("user content feedback should insert");
+    }
+
+    async fn rebuild_user_affinity(transaction: &mut Transaction<'_, Postgres>, user_id: Uuid) {
+        sqlx::query("select public.rebuild_user_topic_affinity($1)")
+            .bind(user_id)
+            .execute(&mut **transaction)
+            .await
+            .expect("user topic affinity should rebuild");
+    }
+
     #[test]
     fn normalizes_topic_slugs_and_deduplicates() {
         let normalized = normalize_topic_slugs(&[
@@ -2014,6 +2406,14 @@ mod tests {
         .expect("slugs should normalize");
 
         assert_eq!(normalized, vec!["technology", "science-research"]);
+    }
+
+    #[test]
+    fn normalizes_single_topic_slug() {
+        let normalized = normalize_single_topic_slug(" Artificial Intelligence ")
+            .expect("slug should normalize");
+
+        assert_eq!(normalized, "artificial-intelligence");
     }
 
     #[test]
@@ -2148,6 +2548,7 @@ mod tests {
 
     #[tokio::test]
     async fn topic_closure_contains_parent_child_relationships() {
+        let _guard = lock_test_database();
         let pool = connect_test_database().await;
         let mut transaction = pool.begin().await.expect("transaction should begin");
 
@@ -2207,6 +2608,7 @@ mod tests {
 
     #[tokio::test]
     async fn topic_hierarchy_rejects_cycles() {
+        let _guard = lock_test_database();
         let pool = connect_test_database().await;
         let mut transaction = pool.begin().await.expect("transaction should begin");
 
@@ -2250,6 +2652,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_source_preview_expands_parent_topics_to_child_tagged_sources() {
+        let _guard = lock_test_database();
         let pool = connect_test_database().await;
         let mut transaction = pool.begin().await.expect("transaction should begin");
 
@@ -2428,7 +2831,624 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_recommendation_subtopics_expand_parent_preferences_to_leaf_topics() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(40);
+        let parent_id = unique_test_uuid(41);
+        let child_id = unique_test_uuid(42);
+        let parent_slug = unique_test_slug("user-subtopics-parent");
+        let child_slug = unique_test_slug("user-subtopics-child");
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &parent_slug,
+            "User Subtopics Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            child_id,
+            &child_slug,
+            "User Subtopics Child",
+            Some(parent_id),
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            insert into public.user_topic_preferences (user_id, topic_id, weight)
+            values ($1, $2, 1.0)
+            "#,
+        )
+        .bind(user_id)
+        .bind(parent_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("user topic preference should insert");
+
+        rebuild_user_affinity(&mut transaction, user_id).await;
+
+        let rows = sqlx::query_as::<_, RecommendationSubtopicRow>(
+            r#"
+            select *
+            from public.get_user_recommendation_subtopics($1)
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("user recommendation subtopics should fetch");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, child_slug);
+        assert_eq!(rows[0].parent_topic_slug, parent_slug);
+        assert!(rows[0].affinity_score > 0.0);
+        assert!(rows[0].is_from_settings);
+        assert!(!rows[0].is_from_behavior);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn user_recommendation_subtopics_mark_behavior_only_topics() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(50);
+        let parent_id = unique_test_uuid(51);
+        let child_id = unique_test_uuid(52);
+        let source_id = unique_test_uuid(53);
+        let content_id = unique_test_uuid(54);
+        let host = format!("{}.example.com", unique_test_slug("behavior-subtopic-host"));
+        let source_url = format!("https://{host}/");
+        let canonical_url = format!("https://{host}/behavior-post");
+        let child_slug = unique_test_slug("behavior-subtopic-child");
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("behavior-subtopic-parent"),
+            "Behavior Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            child_id,
+            &child_slug,
+            "Behavior Child",
+            Some(parent_id),
+        )
+        .await;
+        insert_content_source(
+            &mut transaction,
+            source_id,
+            &source_url,
+            &host,
+            "Behavior Source",
+        )
+        .await;
+        insert_content(
+            &mut transaction,
+            content_id,
+            source_id,
+            &canonical_url,
+            &host,
+            "Behavior Content",
+        )
+        .await;
+        insert_content_topic(&mut transaction, content_id, child_id, 1.0).await;
+        insert_user_content_feedback(&mut transaction, user_id, content_id, source_id, 2.0).await;
+
+        rebuild_user_affinity(&mut transaction, user_id).await;
+
+        let rows = sqlx::query_as::<_, RecommendationSubtopicRow>(
+            r#"
+            select *
+            from public.get_user_recommendation_subtopics($1)
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("user recommendation subtopics should fetch");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, child_slug);
+        assert!(!rows[0].is_from_settings);
+        assert!(rows[0].is_from_behavior);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn user_recommendation_subtopics_sort_scores_and_skip_non_positive_rows() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(60);
+        let parent_id = unique_test_uuid(61);
+        let high_topic_id = unique_test_uuid(62);
+        let low_topic_id = unique_test_uuid(63);
+        let hidden_topic_id = unique_test_uuid(64);
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("sorted-subtopic-parent"),
+            "Sorted Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            high_topic_id,
+            &unique_test_slug("sorted-subtopic-high"),
+            "Sorted High",
+            Some(parent_id),
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            low_topic_id,
+            &unique_test_slug("sorted-subtopic-low"),
+            "Sorted Low",
+            Some(parent_id),
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            hidden_topic_id,
+            &unique_test_slug("sorted-subtopic-hidden"),
+            "Sorted Hidden",
+            Some(parent_id),
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            insert into public.user_topic_affinity (
+                user_id,
+                topic_id,
+                score,
+                signals,
+                last_interacted_at
+            )
+            values
+                ($1, $2, 4.0, 2, timezone('utc', now())),
+                ($1, $3, 1.0, 1, timezone('utc', now()) - interval '1 hour'),
+                ($1, $4, 0.0, 1, timezone('utc', now()) - interval '2 hours')
+            "#,
+        )
+        .bind(user_id)
+        .bind(high_topic_id)
+        .bind(low_topic_id)
+        .bind(hidden_topic_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("user topic affinity rows should insert");
+
+        let rows = sqlx::query_as::<_, RecommendationSubtopicRow>(
+            r#"
+            select *
+            from public.get_user_recommendation_subtopics($1)
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("user recommendation subtopics should fetch");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].affinity_score > rows[1].affinity_score);
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn topic_filtered_candidates_match_exact_content_or_source_topics() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(70);
+        let parent_id = unique_test_uuid(71);
+        let programming_id = unique_test_uuid(72);
+        let devices_id = unique_test_uuid(73);
+        let programming_slug = unique_test_slug("filtered-programming");
+        let devices_slug = unique_test_slug("filtered-devices");
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("filtered-parent"),
+            "Filtered Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            programming_id,
+            &programming_slug,
+            "Programming",
+            Some(parent_id),
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            devices_id,
+            &devices_slug,
+            "Devices",
+            Some(parent_id),
+        )
+        .await;
+
+        let source_a = unique_test_uuid(74);
+        let source_b = unique_test_uuid(75);
+        let source_c = unique_test_uuid(76);
+        let content_a = unique_test_uuid(77);
+        let content_b = unique_test_uuid(78);
+        let content_c = unique_test_uuid(79);
+        let host_a = format!("{}.example.com", unique_test_slug("filtered-host-a"));
+        let host_b = format!("{}.example.com", unique_test_slug("filtered-host-b"));
+        let host_c = format!("{}.example.com", unique_test_slug("filtered-host-c"));
+
+        insert_content_source(
+            &mut transaction,
+            source_a,
+            &format!("https://{host_a}/"),
+            &host_a,
+            "Programming Source",
+        )
+        .await;
+        insert_content_source(
+            &mut transaction,
+            source_b,
+            &format!("https://{host_b}/"),
+            &host_b,
+            "Devices Source",
+        )
+        .await;
+        insert_content_source(
+            &mut transaction,
+            source_c,
+            &format!("https://{host_c}/"),
+            &host_c,
+            "Source Tagged Programming",
+        )
+        .await;
+        insert_content(
+            &mut transaction,
+            content_a,
+            source_a,
+            &format!("https://{host_a}/post-a"),
+            &host_a,
+            "Programming Content Topic",
+        )
+        .await;
+        insert_content(
+            &mut transaction,
+            content_b,
+            source_b,
+            &format!("https://{host_b}/post-b"),
+            &host_b,
+            "Devices Content Topic",
+        )
+        .await;
+        insert_content(
+            &mut transaction,
+            content_c,
+            source_c,
+            &format!("https://{host_c}/post-c"),
+            &host_c,
+            "Programming Source Topic",
+        )
+        .await;
+
+        insert_content_topic(&mut transaction, content_a, programming_id, 1.0).await;
+        insert_content_topic(&mut transaction, content_b, devices_id, 1.0).await;
+        insert_source_topic(&mut transaction, source_c, programming_id, 1.0).await;
+
+        let rows = sqlx::query_as::<_, RecommendationContentCandidateRow>(
+            r#"
+            select *
+            from public.get_content_recommendation_candidates_for_topic($1, $2)
+            "#,
+        )
+        .bind(user_id)
+        .bind(programming_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("filtered topic candidates should fetch");
+
+        let content_ids = rows.into_iter().map(|row| row.content_id).collect::<Vec<_>>();
+        assert!(content_ids.contains(&content_a));
+        assert!(content_ids.contains(&content_c));
+        assert!(!content_ids.contains(&content_b));
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn topic_filtered_candidates_can_be_empty() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(80);
+        let parent_id = unique_test_uuid(81);
+        let topic_id = unique_test_uuid(82);
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("empty-filter-parent"),
+            "Empty Filter Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            topic_id,
+            &unique_test_slug("empty-filter-topic"),
+            "Empty Filter Topic",
+            Some(parent_id),
+        )
+        .await;
+
+        let rows = sqlx::query_as::<_, RecommendationContentCandidateRow>(
+            r#"
+            select *
+            from public.get_content_recommendation_candidates_for_topic($1, $2)
+            "#,
+        )
+        .bind(user_id)
+        .bind(topic_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("filtered topic candidates should fetch");
+
+        assert!(rows.is_empty());
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
+    }
+
+    #[tokio::test]
+    async fn topic_filtered_handler_rejects_invalid_topic_slugs() {
+        let result = list_content_recommendations_by_topic(
+            test_authenticated_user(Uuid::nil()),
+            State(test_app_state()),
+            Path("!!!".to_string()),
+            Query(super::ListRecommendationsQuery { limit: Some(10) }),
+        )
+        .await;
+
+        let response = result.expect_err("invalid slug should fail").into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn topic_filtered_handler_returns_not_found_for_missing_topics() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+
+        let result = list_content_recommendations_by_topic(
+            test_authenticated_user(Uuid::nil()),
+            State(test_app_state_with_pool(pool)),
+            Path(unique_test_slug("missing-topic").to_string()),
+            Query(super::ListRecommendationsQuery { limit: Some(10) }),
+        )
+        .await;
+
+        let response = result.expect_err("missing topic should fail").into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn topic_filtered_handler_persists_topic_slug_in_serve_context() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(85);
+        let parent_id = unique_test_uuid(86);
+        let topic_id = unique_test_uuid(87);
+        let source_id = unique_test_uuid(88);
+        let content_id = unique_test_uuid(89);
+        let topic_slug = unique_test_slug("handler-filter-topic");
+        let host = format!("{}.example.com", unique_test_slug("handler-filter-host"));
+        let source_url = format!("https://{host}/");
+        let canonical_url = format!("https://{host}/filtered-post");
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &unique_test_slug("handler-filter-parent"),
+            "Handler Filter Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            topic_id,
+            &topic_slug,
+            "Handler Filter Topic",
+            Some(parent_id),
+        )
+        .await;
+        insert_content_source(
+            &mut transaction,
+            source_id,
+            &source_url,
+            &host,
+            "Handler Filter Source",
+        )
+        .await;
+        insert_content(
+            &mut transaction,
+            content_id,
+            source_id,
+            &canonical_url,
+            &host,
+            "Handler Filter Content",
+        )
+        .await;
+        insert_content_topic(&mut transaction, content_id, topic_id, 1.0).await;
+
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit for handler visibility");
+
+        let Json(response) = list_content_recommendations_by_topic(
+            test_authenticated_user(user_id),
+            State(test_app_state_with_pool(pool.clone())),
+            Path(topic_slug.clone()),
+            Query(super::ListRecommendationsQuery { limit: Some(10) }),
+        )
+        .await
+        .expect("filtered handler should succeed");
+
+        let stored_topic_slug = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            select request_context ->> 'topic_slug'
+            from public.recommendation_serves
+            where id = $1
+            "#,
+        )
+        .bind(response.serve_id)
+        .fetch_one(&pool)
+        .await
+        .expect("serve context should fetch");
+
+        assert_eq!(stored_topic_slug.as_deref(), Some(topic_slug.as_str()));
+
+        sqlx::query("delete from auth.users where id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("test auth user should clean up");
+        sqlx::query("delete from public.content where id = $1")
+            .bind(content_id)
+            .execute(&pool)
+            .await
+            .expect("test content should clean up");
+        sqlx::query("delete from public.content_sources where id = $1")
+            .bind(source_id)
+            .execute(&pool)
+            .await
+            .expect("test source should clean up");
+        sqlx::query("delete from public.topics where id = any($1)")
+            .bind(vec![topic_id, parent_id])
+            .execute(&pool)
+            .await
+            .expect("test topics should clean up");
+    }
+
+    #[tokio::test]
+    async fn user_subtopics_handler_returns_leaf_subtopics() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+
+        let user_id = unique_test_uuid(90);
+        let parent_id = unique_test_uuid(91);
+        let child_id = unique_test_uuid(92);
+        let parent_slug = unique_test_slug("handler-subtopics-parent");
+        let child_slug = unique_test_slug("handler-subtopics-child");
+
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_topic(
+            &mut transaction,
+            parent_id,
+            &parent_slug,
+            "Handler Subtopics Parent",
+            None,
+        )
+        .await;
+        insert_topic(
+            &mut transaction,
+            child_id,
+            &child_slug,
+            "Handler Subtopics Child",
+            Some(parent_id),
+        )
+        .await;
+
+        sqlx::query(
+            r#"
+            insert into public.user_topic_preferences (user_id, topic_id, weight)
+            values ($1, $2, 1.0)
+            "#,
+        )
+        .bind(user_id)
+        .bind(parent_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("user topic preference should insert");
+
+        rebuild_user_affinity(&mut transaction, user_id).await;
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit for handler visibility");
+
+        let Json(RecommendationSubtopicListResponse { subtopics }) =
+            list_user_recommendation_subtopics(
+                test_authenticated_user(user_id),
+                State(test_app_state_with_pool(pool.clone())),
+            )
+            .await
+            .expect("user subtopics handler should succeed");
+
+        assert_eq!(subtopics.len(), 1);
+        assert_eq!(subtopics[0].slug, child_slug);
+        assert_eq!(subtopics[0].parent_topic_slug, parent_slug);
+        assert!(subtopics[0].is_from_settings);
+
+        sqlx::query("delete from auth.users where id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("test auth user should clean up");
+        sqlx::query("delete from public.topics where id = any($1)")
+            .bind(vec![child_id, parent_id])
+            .execute(&pool)
+            .await
+            .expect("test topics should clean up");
+    }
+
+    #[tokio::test]
     async fn database_backed_source_candidate_tables_accept_reviews() {
+        let _guard = lock_test_database();
         let pool = connect_test_database().await;
         let candidate_id = unique_test_uuid(1);
         let normalized_url = format!("https://candidate-{candidate_id}.example.com/");
@@ -2508,6 +3528,7 @@ mod tests {
 
     #[tokio::test]
     async fn database_backed_source_refresh_queue_accepts_seed_trigger() {
+        let _guard = lock_test_database();
         let pool = connect_test_database().await;
         let source_id = unique_test_uuid(2);
         let source_url = format!("https://seed-trigger-{source_id}.example.com/");
