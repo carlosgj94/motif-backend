@@ -122,6 +122,11 @@ fn build_app(app_state: AppState, cors: CorsLayer) -> Router {
             get(recommendations::get_content_detail),
         )
         .route(
+            "/me/content/{content_id}/save",
+            put(saved_content::save_content_by_id)
+                .delete(saved_content::delete_saved_content_by_content_id),
+        )
+        .route(
             "/me/content/{content_id}/favicon",
             get(saved_content::get_content_favicon),
         )
@@ -163,6 +168,11 @@ fn build_app(app_state: AppState, cors: CorsLayer) -> Router {
         .route(
             "/me/source-subscriptions/{subscription_id}",
             axum::routing::delete(source_subscriptions::delete_source_subscription),
+        )
+        .route(
+            "/me/sources/{source_id}/subscription",
+            put(source_subscriptions::create_source_subscription_by_source_id)
+                .delete(source_subscriptions::delete_source_subscription_by_source_id),
         )
         .route("/me/inbox", get(source_subscriptions::list_inbox))
         .route(

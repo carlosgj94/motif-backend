@@ -95,6 +95,61 @@ pub async fn create_source_subscription(
     Ok((status, Json(summary)))
 }
 
+pub async fn create_source_subscription_by_source_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(source_id): Path<Uuid>,
+) -> ApiResult<(StatusCode, Json<SourceSubscriptionSummary>)> {
+    let mut transaction = state.pool.begin().await.map_err(map_source_error)?;
+    if !source_exists(&mut transaction, source_id).await? {
+        return Err(ApiError::not_found("Source was not found"));
+    }
+
+    let existing_id =
+        find_existing_source_subscription_id(&mut transaction, user.user_id, source_id).await?;
+    let subscription_id =
+        upsert_source_subscription(&mut transaction, user.user_id, source_id).await?;
+
+    let mut invoke_recommendations = false;
+    if existing_id.is_none() {
+        record_internal_source_event(
+            &mut transaction,
+            user.user_id,
+            source_id,
+            InternalEventType::Subscribe,
+            "source_subscriptions",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
+    enqueue_source_refresh(&mut transaction, source_id, "subscribe", 0).await?;
+    invoke_source_processor(&mut transaction, source_id, "subscribe").await?;
+    if invoke_recommendations {
+        sync_recommendation_targets_for_signal(
+            &mut transaction,
+            Some(user.user_id),
+            None,
+            Some(source_id),
+        )
+        .await?;
+    }
+
+    transaction.commit().await.map_err(map_source_error)?;
+
+    let summary = fetch_source_subscription_summary(&state.pool, user.user_id, subscription_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("Source subscription disappeared after save"))?;
+
+    let status = if existing_id.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((status, Json(summary)))
+}
+
 pub async fn list_source_subscriptions(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -175,6 +230,57 @@ pub async fn delete_source_subscription(
             Ok(StatusCode::NO_CONTENT)
         }
         None => Err(ApiError::not_found("Source subscription was not found")),
+    }
+}
+
+pub async fn delete_source_subscription_by_source_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(source_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let mut transaction = state.pool.begin().await.map_err(map_source_error)?;
+    let deleted = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        delete from public.source_subscriptions
+        where user_id = $1 and source_id = $2
+        returning source_id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(source_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_source_error)?;
+
+    match deleted {
+        Some(source_id) => {
+            record_internal_source_event(
+                &mut transaction,
+                user.user_id,
+                source_id,
+                InternalEventType::Unsubscribe,
+                "source_subscriptions",
+            )
+            .await?;
+            sync_recommendation_targets_for_signal(
+                &mut transaction,
+                Some(user.user_id),
+                None,
+                Some(source_id),
+            )
+            .await?;
+            transaction.commit().await.map_err(map_source_error)?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        None => {
+            let exists = source_exists(&mut transaction, source_id).await?;
+            transaction.commit().await.map_err(map_source_error)?;
+            if exists {
+                Ok(StatusCode::NO_CONTENT)
+            } else {
+                Err(ApiError::not_found("Source was not found"))
+            }
+        }
     }
 }
 
@@ -646,6 +752,25 @@ async fn find_existing_source_subscription_id(
     .bind(user_id)
     .bind(source_id)
     .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_source_error)
+}
+
+async fn source_exists(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_id: Uuid,
+) -> ApiResult<bool> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+            select 1
+            from public.content_sources
+            where id = $1
+        )
+        "#,
+    )
+    .bind(source_id)
+    .fetch_one(&mut **transaction)
     .await
     .map_err(map_source_error)
 }

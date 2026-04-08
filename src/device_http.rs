@@ -8,7 +8,7 @@ use axum::{
     },
     http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
@@ -50,7 +50,16 @@ pub fn router() -> Router<AppState> {
             get(list_recommendation_subtopics),
         )
         .route("/me/content/{content_id}", get(get_content_detail))
+        .route(
+            "/me/content/{content_id}/save",
+            put(save_content_by_id).delete(delete_saved_content_by_content_id),
+        )
         .route("/me/content/{content_id}/package", get(get_content_package))
+        .route(
+            "/me/sources/{source_id}/subscription",
+            put(create_source_subscription_by_source_id)
+                .delete(delete_source_subscription_by_source_id),
+        )
         .fallback(device_not_found)
         .method_not_allowed_fallback(device_method_not_allowed)
 }
@@ -148,6 +157,24 @@ async fn get_content_detail(
         .map(map_json)
 }
 
+async fn save_content_by_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(content_id): DevicePath<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    saved_content::save_content_by_id(user, State(state), Path(content_id))
+        .await
+        .map(map_json_response)
+}
+
+async fn delete_saved_content_by_content_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(content_id): DevicePath<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    saved_content::delete_saved_content_by_content_id(user, State(state), Path(content_id)).await
+}
+
 async fn get_content_package(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -170,6 +197,33 @@ async fn list_content_recommendations_by_topic(
     )
     .await
     .map(map_json)
+}
+
+async fn create_source_subscription_by_source_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(source_id): DevicePath<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    source_subscriptions::create_source_subscription_by_source_id(
+        user,
+        State(state),
+        Path(source_id),
+    )
+    .await
+    .map(map_json_response)
+}
+
+async fn delete_source_subscription_by_source_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    DevicePath(source_id): DevicePath<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    source_subscriptions::delete_source_subscription_by_source_id(
+        user,
+        State(state),
+        Path(source_id),
+    )
+    .await
 }
 
 async fn list_recommendation_subtopics(
@@ -195,6 +249,12 @@ async fn device_method_not_allowed() -> ApiError {
 
 fn map_json<T>(Json(value): Json<T>) -> DeviceJson<T> {
     DeviceJson(value)
+}
+
+fn map_json_response<T>(
+    (status, Json(value)): (StatusCode, Json<T>),
+) -> (StatusCode, DeviceJson<T>) {
+    (status, DeviceJson(value))
 }
 
 fn map_rejection(status: StatusCode, message: String) -> ApiError {
@@ -631,5 +691,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filtered.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn save_and_subscription_write_routes_exist_and_require_auth() {
+        let app = router().with_state(test_state());
+        let content_id = Uuid::from_u128(10);
+        let source_id = Uuid::from_u128(11);
+
+        let save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/me/content/{content_id}/save"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::UNAUTHORIZED);
+
+        let unsave = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/me/content/{content_id}/save"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsave.status(), StatusCode::UNAUTHORIZED);
+
+        let subscribe = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/me/sources/{source_id}/subscription"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscribe.status(), StatusCode::UNAUTHORIZED);
+
+        let unsubscribe = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/me/sources/{source_id}/subscription"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsubscribe.status(), StatusCode::UNAUTHORIZED);
     }
 }

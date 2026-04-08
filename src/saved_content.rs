@@ -124,6 +124,79 @@ pub async fn save_saved_content(
     Ok((status, Json(summary)))
 }
 
+pub async fn save_content_by_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(content_id): Path<Uuid>,
+) -> ApiResult<(StatusCode, Json<SavedContentSummary>)> {
+    let mut transaction = state.pool.begin().await.map_err(map_saved_content_error)?;
+    let content = fetch_content_save_target(&mut transaction, content_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Content was not found"))?;
+    let existing_id =
+        find_existing_saved_content_id(&mut transaction, user.user_id, content.id).await?;
+    let saved_content_id = upsert_saved_content(
+        &mut transaction,
+        user.user_id,
+        content.id,
+        &content.canonical_url,
+    )
+    .await?;
+
+    let mut invoke_recommendations = false;
+    if existing_id.is_none() {
+        record_internal_content_event(
+            &mut transaction,
+            user.user_id,
+            content.id,
+            None,
+            InternalEventType::Save,
+            "saved_content",
+        )
+        .await?;
+        invoke_recommendations = true;
+    }
+
+    let processing_state = content.processing_state();
+    let should_enqueue_processing = should_enqueue_content_processing(&processing_state);
+    if should_enqueue_processing {
+        enqueue_content_processing(&mut transaction, content.id, "save", 0).await?;
+        invoke_content_processor(&mut transaction, content.id, "save").await?;
+    }
+
+    if invoke_recommendations {
+        sync_recommendation_targets_for_signal(
+            &mut transaction,
+            Some(user.user_id),
+            Some(content.id),
+            None,
+        )
+        .await?;
+    }
+
+    transaction
+        .commit()
+        .await
+        .map_err(map_saved_content_error)?;
+
+    let summary = wait_for_saved_content_summary(
+        &state.pool,
+        user.user_id,
+        saved_content_id,
+        should_enqueue_processing,
+    )
+    .await?
+    .ok_or_else(|| ApiError::internal("Saved content disappeared after save"))?;
+
+    let status = if existing_id.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((status, Json(summary)))
+}
+
 pub async fn list_saved_content(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -399,6 +472,46 @@ pub async fn delete_saved_content(
     }
 }
 
+pub async fn delete_saved_content_by_content_id(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(content_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let mut transaction = state.pool.begin().await.map_err(map_saved_content_error)?;
+    let deleted = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        delete from public.saved_content
+        where user_id = $1 and content_id = $2
+        returning id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(content_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_saved_content_error)?;
+
+    if deleted.is_some() {
+        transaction
+            .commit()
+            .await
+            .map_err(map_saved_content_error)?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    let content_exists = content_exists(&mut transaction, content_id).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(map_saved_content_error)?;
+
+    if content_exists {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Content was not found"))
+    }
+}
+
 pub async fn list_content_tags(
     user: AuthenticatedUser,
     State(state): State<AppState>,
@@ -507,6 +620,28 @@ async fn get_or_create_content(
     .map_err(map_saved_content_error)
 }
 
+async fn fetch_content_save_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    content_id: Uuid,
+) -> ApiResult<Option<ContentSaveTargetRow>> {
+    sqlx::query_as::<_, ContentSaveTargetRow>(
+        r#"
+        select
+            id,
+            canonical_url,
+            fetch_status,
+            parse_status,
+            (parsed_document is not null) as has_parsed_document
+        from public.content
+        where id = $1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_saved_content_error)
+}
+
 async fn attempt_source_discovery_for_saved_content(
     pool: &PgPool,
     normalized_url: &NormalizedUrl,
@@ -577,6 +712,25 @@ async fn load_linked_source_id(
     )
     .bind(content_id)
     .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_saved_content_error)
+}
+
+async fn content_exists(
+    transaction: &mut Transaction<'_, Postgres>,
+    content_id: Uuid,
+) -> ApiResult<bool> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+            select 1
+            from public.content
+            where id = $1
+        )
+        "#,
+    )
+    .bind(content_id)
+    .fetch_one(&mut **transaction)
     .await
     .map_err(map_saved_content_error)
 }
@@ -1544,6 +1698,26 @@ struct ContentProcessingStateRow {
     fetch_status: String,
     parse_status: String,
     has_parsed_document: bool,
+}
+
+#[derive(Debug, FromRow)]
+struct ContentSaveTargetRow {
+    id: Uuid,
+    canonical_url: String,
+    fetch_status: String,
+    parse_status: String,
+    has_parsed_document: bool,
+}
+
+impl ContentSaveTargetRow {
+    fn processing_state(&self) -> ContentProcessingStateRow {
+        ContentProcessingStateRow {
+            id: self.id,
+            fetch_status: self.fetch_status.clone(),
+            parse_status: self.parse_status.clone(),
+            has_parsed_document: self.has_parsed_document,
+        }
+    }
 }
 
 #[derive(Debug, FromRow)]

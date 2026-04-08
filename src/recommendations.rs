@@ -361,7 +361,7 @@ pub async fn list_user_recommendation_subtopics(
 }
 
 pub async fn get_content_detail(
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(content_id): Path<Uuid>,
 ) -> ApiResult<Json<RecommendationContentDetail>> {
@@ -369,6 +369,9 @@ pub async fn get_content_detail(
         r#"
         select
             c.id as content_id,
+            null::uuid as saved_content_id,
+            false as is_saved,
+            false as is_subscribed_source,
             c.canonical_url,
             c.resolved_url,
             c.host,
@@ -383,12 +386,33 @@ pub async fn get_content_detail(
             c.fetch_status,
             c.parse_status,
             c.parsed_at,
-            c.parsed_document
+            c.parsed_document,
+            sc.id as saved_content_id,
+            (sc.id is not null) as is_saved,
+            (ss.id is not null) as is_subscribed_source,
+            cs.id as source_id,
+            cs.source_url,
+            cs.resolved_source_url,
+            cs.host as source_host,
+            cs.title as source_title,
+            cs.source_kind as source_preview_kind,
+            sf.feed_url as primary_feed_url
         from public.content c
+        left join public.saved_content sc
+          on sc.content_id = c.id
+         and sc.user_id = $2
+        left join public.content_sources cs
+          on cs.id = c.source_id
+        left join public.source_subscriptions ss
+          on ss.source_id = cs.id
+         and ss.user_id = $2
+        left join public.source_feeds sf
+          on sf.id = cs.primary_feed_id
         where c.id = $1
         "#,
     )
     .bind(content_id)
+    .bind(user.user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(map_recommendation_error)?
@@ -420,7 +444,14 @@ pub async fn get_content_package(
             c.fetch_status,
             c.parse_status,
             c.parsed_at,
-            c.parsed_document
+            c.parsed_document,
+            null::uuid as source_id,
+            null::text as source_url,
+            null::text as resolved_source_url,
+            null::text as source_host,
+            null::text as source_title,
+            null::text as source_preview_kind,
+            null::text as primary_feed_url
         from public.content c
         where c.id = $1
         "#,
@@ -1127,6 +1158,16 @@ fn build_recommendation_source_summary(
 fn build_content_detail(
     row: RecommendationContentDetailRow,
 ) -> ApiResult<RecommendationContentDetail> {
+    let source_preview_kind = parse_optional_source_kind(row.source_preview_kind.as_deref())?;
+    let source = row.source_id.map(|source_id| RecommendationSourcePreview {
+        id: source_id,
+        source_url: row.source_url.clone(),
+        resolved_source_url: row.resolved_source_url.clone(),
+        host: row.source_host.clone().unwrap_or_else(|| row.host.clone()),
+        title: row.source_title.clone(),
+        source_kind: source_preview_kind,
+        primary_feed_url: row.primary_feed_url.clone(),
+    });
     let body = row.parsed_document.as_ref().and_then(|document| {
         build_compact_content_body(
             &document.0,
@@ -1138,6 +1179,9 @@ fn build_content_detail(
 
     Ok(RecommendationContentDetail {
         id: row.content_id,
+        is_saved: row.is_saved,
+        saved_content_id: row.saved_content_id,
+        is_subscribed_source: row.is_subscribed_source,
         canonical_url: row.canonical_url,
         resolved_url: row.resolved_url,
         host: row.host,
@@ -1154,6 +1198,7 @@ fn build_content_detail(
         parse_status: parse_db_processing_status(&row.parse_status)?,
         parsed_at: maybe_timestamp_seconds(row.parsed_at),
         body,
+        source,
     })
 }
 
@@ -1785,6 +1830,10 @@ pub struct RecommendationSourceSummary {
 #[derive(Debug, Serialize)]
 pub struct RecommendationContentDetail {
     id: Uuid,
+    is_saved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saved_content_id: Option<Uuid>,
+    is_subscribed_source: bool,
     canonical_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     resolved_url: Option<String>,
@@ -1811,6 +1860,8 @@ pub struct RecommendationContentDetail {
     parsed_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<CompactContentBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<RecommendationSourcePreview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2011,6 +2062,9 @@ struct RecommendationSourceCandidateRow {
 #[derive(Debug, FromRow)]
 struct RecommendationContentDetailRow {
     content_id: Uuid,
+    saved_content_id: Option<Uuid>,
+    is_saved: bool,
+    is_subscribed_source: bool,
     canonical_url: String,
     resolved_url: Option<String>,
     host: String,
@@ -2026,6 +2080,13 @@ struct RecommendationContentDetailRow {
     parse_status: String,
     parsed_at: Option<OffsetDateTime>,
     parsed_document: Option<SqlxJson<Value>>,
+    source_id: Option<Uuid>,
+    source_url: Option<String>,
+    resolved_source_url: Option<String>,
+    source_host: Option<String>,
+    source_title: Option<String>,
+    source_preview_kind: Option<String>,
+    primary_feed_url: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -2077,10 +2138,10 @@ mod tests {
         RecommendationSourceCandidateRow, RecommendationSubtopicListResponse,
         RecommendationSubtopicRow, RecommendationTopicRow, SourceScoreInputs,
         build_recommendation_topic, build_recommendation_topics, freshness_score,
-        list_content_recommendations_by_topic, list_user_recommendation_subtopics,
-        normalize_language_codes, normalize_positive_score, normalize_single_topic_slug,
-        normalize_topic_slugs, preview_source_recommendations, score_content_recommendation,
-        score_public_source_preview, score_source_recommendation,
+        get_content_detail, list_content_recommendations_by_topic,
+        list_user_recommendation_subtopics, normalize_language_codes, normalize_positive_score,
+        normalize_single_topic_slug, normalize_topic_slugs, preview_source_recommendations,
+        score_content_recommendation, score_public_source_preview, score_source_recommendation,
         validate_public_interaction_event,
     };
     use crate::{
@@ -2089,12 +2150,13 @@ mod tests {
         auth_api::SupabaseAuthApi,
         config::SupabaseConfig,
         rate_limit::AuthRateLimiter,
+        saved_content, source_subscriptions,
     };
-    use axum::response::IntoResponse;
     use axum::{
         Json,
         extract::{Path, Query, State},
     };
+    use axum::{http::StatusCode, response::IntoResponse};
     use serde_json::json;
     use sqlx::{PgPool, Postgres, Transaction, migrate::Migrator, postgres::PgPoolOptions};
     use std::{
@@ -2278,6 +2340,47 @@ mod tests {
         .expect("content source should insert");
     }
 
+    async fn insert_primary_source_feed(
+        transaction: &mut Transaction<'_, Postgres>,
+        source_id: Uuid,
+        feed_url: &str,
+    ) {
+        let feed_id = unique_test_uuid(9_000);
+        sqlx::query(
+            r#"
+            insert into public.source_feeds (
+                id,
+                source_id,
+                feed_url,
+                feed_kind,
+                discovery_method,
+                is_primary,
+                refresh_status
+            )
+            values ($1, $2, $3, 'rss', 'provided', true, 'succeeded')
+            "#,
+        )
+        .bind(feed_id)
+        .bind(source_id)
+        .bind(feed_url)
+        .execute(&mut **transaction)
+        .await
+        .expect("source feed should insert");
+
+        sqlx::query(
+            r#"
+            update public.content_sources
+            set primary_feed_id = $2
+            where id = $1
+            "#,
+        )
+        .bind(source_id)
+        .bind(feed_id)
+        .execute(&mut **transaction)
+        .await
+        .expect("content source should link primary feed");
+    }
+
     async fn insert_content(
         transaction: &mut Transaction<'_, Postgres>,
         content_id: Uuid,
@@ -2392,6 +2495,74 @@ mod tests {
         .execute(&mut **transaction)
         .await
         .expect("user content feedback should insert");
+    }
+
+    async fn cleanup_user_content_source(
+        pool: &PgPool,
+        user_id: Uuid,
+        content_id: Uuid,
+        source_id: Uuid,
+    ) {
+        sqlx::query("delete from public.user_topic_affinity where user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("user topic affinity should clean up");
+        sqlx::query("delete from public.user_content_feedback where user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("user content feedback should clean up");
+        sqlx::query(
+            r#"
+            delete from public.interaction_events
+            where user_id = $1
+              and (
+                    content_id = $2
+                 or source_id = $3
+              )
+            "#,
+        )
+        .bind(user_id)
+        .bind(content_id)
+        .bind(source_id)
+        .execute(pool)
+        .await
+        .expect("interaction events should clean up");
+        sqlx::query("delete from public.saved_content where user_id = $1 and content_id = $2")
+            .bind(user_id)
+            .bind(content_id)
+            .execute(pool)
+            .await
+            .expect("saved content should clean up");
+        sqlx::query(
+            "delete from public.source_subscriptions where user_id = $1 and source_id = $2",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .execute(pool)
+        .await
+        .expect("source subscriptions should clean up");
+        sqlx::query("delete from public.source_feeds where source_id = $1")
+            .bind(source_id)
+            .execute(pool)
+            .await
+            .expect("source feeds should clean up");
+        sqlx::query("delete from public.content where id = $1")
+            .bind(content_id)
+            .execute(pool)
+            .await
+            .expect("content should clean up");
+        sqlx::query("delete from public.content_sources where id = $1")
+            .bind(source_id)
+            .execute(pool)
+            .await
+            .expect("content source should clean up");
+        sqlx::query("delete from auth.users where id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("auth user should clean up");
     }
 
     async fn rebuild_user_affinity(transaction: &mut Transaction<'_, Postgres>, user_id: Uuid) {
@@ -3416,6 +3587,217 @@ mod tests {
             .execute(&pool)
             .await
             .expect("test topics should clean up");
+    }
+
+    #[tokio::test]
+    async fn content_detail_returns_current_save_and_subscription_state() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let user_id = unique_test_uuid(8_500);
+        let source_id = unique_test_uuid(8_501);
+        let content_id = unique_test_uuid(8_502);
+        let saved_content_id = unique_test_uuid(8_503);
+        let host = format!("{}.example.com", unique_test_slug("detail-state-host"));
+        let source_url = format!("https://{host}/");
+        let canonical_url = format!("https://{host}/article");
+        let feed_url = format!("https://{host}/feed.xml");
+
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_content_source(
+            &mut transaction,
+            source_id,
+            &source_url,
+            &host,
+            "Detail Source",
+        )
+        .await;
+        insert_primary_source_feed(&mut transaction, source_id, &feed_url).await;
+        insert_content(
+            &mut transaction,
+            content_id,
+            source_id,
+            &canonical_url,
+            &host,
+            "Detail Content",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            insert into public.saved_content (id, user_id, content_id, submitted_url)
+            values ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(saved_content_id)
+        .bind(user_id)
+        .bind(content_id)
+        .bind(&canonical_url)
+        .execute(&mut *transaction)
+        .await
+        .expect("saved content should insert");
+        sqlx::query(
+            r#"
+            insert into public.source_subscriptions (user_id, source_id)
+            values ($1, $2)
+            "#,
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("source subscription should insert");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit for handler visibility");
+
+        let Json(detail) = get_content_detail(
+            test_authenticated_user(user_id),
+            State(test_app_state_with_pool(pool.clone())),
+            Path(content_id),
+        )
+        .await
+        .expect("content detail should succeed");
+
+        let value = serde_json::to_value(detail).expect("detail should serialize");
+        assert_eq!(value["id"], json!(content_id));
+        assert_eq!(value["is_saved"], json!(true));
+        assert_eq!(value["saved_content_id"], json!(saved_content_id));
+        assert_eq!(value["is_subscribed_source"], json!(true));
+        assert_eq!(value["source"]["id"], json!(source_id));
+        assert_eq!(value["source"]["source_url"], json!(source_url));
+        assert_eq!(value["source"]["primary_feed_url"], json!(feed_url));
+
+        cleanup_user_content_source(&pool, user_id, content_id, source_id).await;
+    }
+
+    #[tokio::test]
+    async fn save_by_content_id_and_subscription_by_source_id_are_idempotent() {
+        let _guard = lock_test_database();
+        let pool = connect_test_database().await;
+        let user_id = unique_test_uuid(8_600);
+        let source_id = unique_test_uuid(8_601);
+        let content_id = unique_test_uuid(8_602);
+        let host = format!(
+            "{}.example.com",
+            unique_test_slug("idempotent-contract-host")
+        );
+        let source_url = format!("https://{host}/");
+        let canonical_url = format!("https://{host}/article");
+
+        let mut transaction = pool.begin().await.expect("transaction should begin");
+        insert_auth_user(&mut transaction, user_id).await;
+        insert_content_source(
+            &mut transaction,
+            source_id,
+            &source_url,
+            &host,
+            "Idempotent Source",
+        )
+        .await;
+        insert_content(
+            &mut transaction,
+            content_id,
+            source_id,
+            &canonical_url,
+            &host,
+            "Idempotent Content",
+        )
+        .await;
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit for handler visibility");
+
+        let first_save = saved_content::save_content_by_id(
+            test_authenticated_user(user_id),
+            State(test_app_state_with_pool(pool.clone())),
+            Path(content_id),
+        )
+        .await
+        .expect("first save should succeed");
+        assert_eq!(first_save.0, StatusCode::CREATED);
+
+        let second_save = saved_content::save_content_by_id(
+            test_authenticated_user(user_id),
+            State(test_app_state_with_pool(pool.clone())),
+            Path(content_id),
+        )
+        .await
+        .expect("second save should succeed");
+        assert_eq!(second_save.0, StatusCode::OK);
+        let first_save_value =
+            serde_json::to_value(&first_save.1.0).expect("save should serialize");
+        let second_save_value =
+            serde_json::to_value(&second_save.1.0).expect("save should serialize");
+        assert_eq!(second_save_value["id"], first_save_value["id"]);
+
+        assert_eq!(
+            saved_content::delete_saved_content_by_content_id(
+                test_authenticated_user(user_id),
+                State(test_app_state_with_pool(pool.clone())),
+                Path(content_id),
+            )
+            .await
+            .expect("first delete should succeed"),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            saved_content::delete_saved_content_by_content_id(
+                test_authenticated_user(user_id),
+                State(test_app_state_with_pool(pool.clone())),
+                Path(content_id),
+            )
+            .await
+            .expect("second delete should stay idempotent"),
+            StatusCode::NO_CONTENT
+        );
+
+        let first_subscribe = source_subscriptions::create_source_subscription_by_source_id(
+            test_authenticated_user(user_id),
+            State(test_app_state_with_pool(pool.clone())),
+            Path(source_id),
+        )
+        .await
+        .expect("first subscribe should succeed");
+        assert_eq!(first_subscribe.0, StatusCode::CREATED);
+
+        let second_subscribe = source_subscriptions::create_source_subscription_by_source_id(
+            test_authenticated_user(user_id),
+            State(test_app_state_with_pool(pool.clone())),
+            Path(source_id),
+        )
+        .await
+        .expect("second subscribe should succeed");
+        assert_eq!(second_subscribe.0, StatusCode::OK);
+        let first_subscribe_value =
+            serde_json::to_value(&first_subscribe.1.0).expect("subscription should serialize");
+        let second_subscribe_value =
+            serde_json::to_value(&second_subscribe.1.0).expect("subscription should serialize");
+        assert_eq!(second_subscribe_value["id"], first_subscribe_value["id"]);
+
+        assert_eq!(
+            source_subscriptions::delete_source_subscription_by_source_id(
+                test_authenticated_user(user_id),
+                State(test_app_state_with_pool(pool.clone())),
+                Path(source_id),
+            )
+            .await
+            .expect("first unsubscribe should succeed"),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            source_subscriptions::delete_source_subscription_by_source_id(
+                test_authenticated_user(user_id),
+                State(test_app_state_with_pool(pool.clone())),
+                Path(source_id),
+            )
+            .await
+            .expect("second unsubscribe should stay idempotent"),
+            StatusCode::NO_CONTENT
+        );
+
+        cleanup_user_content_source(&pool, user_id, content_id, source_id).await;
     }
 
     #[tokio::test]
