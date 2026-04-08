@@ -298,7 +298,10 @@ fn map_path_rejection(rejection: PathRejection) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{auth::SupabaseAuth, auth_api::SupabaseAuthApi, config::SupabaseConfig, rate_limit::AuthRateLimiter};
+    use crate::{
+        auth::SupabaseAuth, auth_api::SupabaseAuthApi, config::SupabaseConfig,
+        rate_limit::AuthRateLimiter,
+    };
     use axum::{
         http::{Method, Request},
         routing::get,

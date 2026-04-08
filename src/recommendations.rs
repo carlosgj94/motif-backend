@@ -33,7 +33,8 @@ const MAX_BATCH_EVENT_COUNT: usize = 50;
 const MAX_TOPIC_PREFERENCES: usize = 16;
 const MAX_LANGUAGE_PREFERENCES: usize = 8;
 const IMMEDIATE_RECOMMENDATION_ROLLUP_LIMIT: i32 = 10_000;
-const RECOMMENDATION_ALGORITHM_VERSION: &str = "v1-postgres-hybrid-quality-prior";
+const RECOMMENDATION_ALGORITHM_VERSION: &str =
+    "v2-postgres-hybrid-quality-prior-evergreen-curation";
 
 pub async fn list_recommendation_topics(
     State(state): State<AppState>,
@@ -138,6 +139,7 @@ async fn build_content_recommendation_response(
             let content_halo = row.content_halo_score;
             let source_halo = row.source_halo_score;
             let editorial_score = row.editorial_score;
+            let curated_score = row.curated_score;
             let freshness = freshness_score(row.published_at.unwrap_or(row.created_at), 30.0);
             let subscribed_inbox_boost = if row.subscribed_inbox
                 || row.source_id.is_some_and(|source_id| {
@@ -159,6 +161,7 @@ async fn build_content_recommendation_response(
                 content_halo,
                 source_halo,
                 editorial_score,
+                curated_score,
                 freshness,
                 subscribed_inbox_boost,
                 exploration_boost,
@@ -170,6 +173,7 @@ async fn build_content_recommendation_response(
                 "discovery": row.discovery,
                 "saved_adjacent": row.saved_adjacent,
                 "trending": row.trending,
+                "evergreen": row.evergreen,
             });
 
             Some(ScoredContentCandidate {
@@ -182,6 +186,7 @@ async fn build_content_recommendation_response(
                     "content_halo": content_halo,
                     "source_halo": source_halo,
                     "editorial_score": editorial_score,
+                    "curated_score": curated_score,
                     "freshness": freshness,
                     "subscribed_inbox_boost": subscribed_inbox_boost,
                     "exploration_boost": exploration_boost,
@@ -212,10 +217,7 @@ async fn build_content_recommendation_response(
         })
         .collect::<ApiResult<Vec<_>>>()?;
 
-    Ok(ContentRecommendationListResponse {
-        serve_id,
-        content,
-    })
+    Ok(ContentRecommendationListResponse { serve_id, content })
 }
 
 pub async fn list_source_recommendations(
@@ -1512,6 +1514,7 @@ struct ContentScoreInputs {
     content_halo: f64,
     source_halo: f64,
     editorial_score: f64,
+    curated_score: f64,
     freshness: f64,
     subscribed_inbox_boost: f64,
     exploration_boost: f64,
@@ -1535,14 +1538,15 @@ struct PublicSourcePreviewScoreInputs {
 }
 
 fn score_content_recommendation(input: ContentScoreInputs) -> f64 {
-    ((0.25 * input.topic_match)
-        + (0.18 * input.source_affinity)
-        + (0.12 * input.content_halo)
-        + (0.08 * input.source_halo)
-        + (0.10 * input.editorial_score)
-        + (0.10 * input.freshness)
-        + (0.12 * input.subscribed_inbox_boost)
-        + (0.05 * input.exploration_boost))
+    ((0.22 * input.topic_match)
+        + (0.16 * input.source_affinity)
+        + (0.10 * input.content_halo)
+        + (0.07 * input.source_halo)
+        + (0.08 * input.editorial_score)
+        + (0.18 * input.curated_score)
+        + (0.08 * input.freshness)
+        + (0.08 * input.subscribed_inbox_boost)
+        + (0.03 * input.exploration_boost))
         - input.repeat_penalty
 }
 
@@ -1950,6 +1954,7 @@ struct RecommendationContentCandidateRow {
     discovery: bool,
     saved_adjacent: bool,
     trending: bool,
+    evergreen: bool,
     canonical_url: String,
     resolved_url: Option<String>,
     host: String,
@@ -1977,6 +1982,7 @@ struct RecommendationContentCandidateRow {
     content_halo_score: f64,
     source_halo_score: f64,
     editorial_score: f64,
+    curated_score: f64,
     dismiss_count: i32,
     mark_read_count: i32,
     read_ratio: f64,
@@ -2510,6 +2516,7 @@ mod tests {
             content_halo: 0.5,
             source_halo: 0.4,
             editorial_score: 0.1,
+            curated_score: 0.0,
             freshness: 0.8,
             subscribed_inbox_boost: 0.0,
             exploration_boost: 1.0,
@@ -2521,6 +2528,7 @@ mod tests {
             content_halo: 0.5,
             source_halo: 0.4,
             editorial_score: 1.0,
+            curated_score: 0.0,
             freshness: 0.8,
             subscribed_inbox_boost: 0.0,
             exploration_boost: 1.0,
@@ -2528,6 +2536,36 @@ mod tests {
         });
 
         assert!(high_quality > low_quality);
+    }
+
+    #[test]
+    fn content_recommendation_score_rewards_curated_evergreen_priority() {
+        let base = score_content_recommendation(ContentScoreInputs {
+            topic_match: 0.5,
+            source_affinity: 0.4,
+            content_halo: 0.2,
+            source_halo: 0.1,
+            editorial_score: 0.4,
+            curated_score: 0.0,
+            freshness: 0.0,
+            subscribed_inbox_boost: 0.0,
+            exploration_boost: 1.0,
+            repeat_penalty: 0.0,
+        });
+        let curated = score_content_recommendation(ContentScoreInputs {
+            topic_match: 0.5,
+            source_affinity: 0.4,
+            content_halo: 0.2,
+            source_halo: 0.1,
+            editorial_score: 0.4,
+            curated_score: 1.0,
+            freshness: 0.0,
+            subscribed_inbox_boost: 0.0,
+            exploration_boost: 1.0,
+            repeat_penalty: 0.0,
+        });
+
+        assert!(curated > base);
     }
 
     #[tokio::test]
@@ -3181,7 +3219,10 @@ mod tests {
         .await
         .expect("filtered topic candidates should fetch");
 
-        let content_ids = rows.into_iter().map(|row| row.content_id).collect::<Vec<_>>();
+        let content_ids = rows
+            .into_iter()
+            .map(|row| row.content_id)
+            .collect::<Vec<_>>();
         assert!(content_ids.contains(&content_a));
         assert!(content_ids.contains(&content_c));
         assert!(!content_ids.contains(&content_b));
@@ -3250,7 +3291,9 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("invalid slug should fail").into_response();
+        let response = result
+            .expect_err("invalid slug should fail")
+            .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -3267,7 +3310,9 @@ mod tests {
         )
         .await;
 
-        let response = result.expect_err("missing topic should fail").into_response();
+        let response = result
+            .expect_err("missing topic should fail")
+            .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
     }
 

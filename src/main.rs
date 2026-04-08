@@ -273,20 +273,23 @@ mod tests {
 
     #[tokio::test]
     async fn topic_recommendation_routes_exist_and_require_auth() {
-        let app = build_app(test_app_state(), build_cors_layer(&Config {
-            bind_addr: "127.0.0.1:3000".parse().expect("socket should parse"),
-            cors_allowed_origins: vec!["http://localhost:3000".to_string()],
-            database_url: "postgresql://postgres:postgres@localhost/postgres".to_string(),
-            db_max_connections: 1,
-            supabase: SupabaseConfig {
-                url: "http://127.0.0.1:9999".to_string(),
-                issuer: "http://127.0.0.1:9999/auth/v1".to_string(),
-                jwks_url: "http://127.0.0.1:9999/auth/v1/.well-known/jwks.json".to_string(),
-                audience: "authenticated".to_string(),
-                jwks_cache_ttl: Duration::from_secs(300),
-                publishable_key: Some("publishable-test-key".to_string()),
-            },
-        }));
+        let app = build_app(
+            test_app_state(),
+            build_cors_layer(&Config {
+                bind_addr: "127.0.0.1:3000".parse().expect("socket should parse"),
+                cors_allowed_origins: vec!["http://localhost:3000".to_string()],
+                database_url: "postgresql://postgres:postgres@localhost/postgres".to_string(),
+                db_max_connections: 1,
+                supabase: SupabaseConfig {
+                    url: "http://127.0.0.1:9999".to_string(),
+                    issuer: "http://127.0.0.1:9999/auth/v1".to_string(),
+                    jwks_url: "http://127.0.0.1:9999/auth/v1/.well-known/jwks.json".to_string(),
+                    audience: "authenticated".to_string(),
+                    jwks_cache_ttl: Duration::from_secs(300),
+                    publishable_key: Some("publishable-test-key".to_string()),
+                },
+            }),
+        );
 
         let subtopics = app
             .clone()
